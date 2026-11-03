@@ -10,7 +10,13 @@ keywords = ["multimedia", "video", "prores", "raw", "bayer"]
 categories = ["multimedia::encoding", "multimedia::video"]
 publish = false
 
+[features]
+default = ["parallel"]
+# Decode tile rows on a rayon thread pool.
+parallel = ["dep:rayon"]
+
 [dependencies]
+rayon = { version = "1.10", optional = true }
 
 [lints.rust]
 unsafe_code = "forbid"

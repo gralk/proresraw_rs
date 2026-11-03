@@ -153,6 +153,13 @@ pub fn decode_frame(packet: &[u8]) -> Result<Frame> {
                 Ok(())
             })
     };
+    #[cfg(feature = "parallel")]
+    {
+        use rayon::prelude::*;
+        let rows: Vec<_> = tile_rows.zip(payload_rows).collect();
+        rows.into_par_iter().enumerate().try_for_each(decode_row)?;
+    }
+    #[cfg(not(feature = "parallel"))]
     tile_rows
         .zip(payload_rows)
         .enumerate()
