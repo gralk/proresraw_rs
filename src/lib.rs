@@ -14,6 +14,9 @@
 //! `docs/bitstream.md`. Demuxing is out of scope; any QuickTime reader
 //! that yields samples works.
 //!
+//! With the `gpu` feature, [`gpu::GpuDecoder`] decodes on a wgpu device
+//! the application provides and leaves the code values in a GPU buffer.
+//!
 //! ```no_run
 //! let packet = std::fs::read("frame.bin").unwrap();
 //! let frame = proresraw_rs::decode_frame(&packet).unwrap();
@@ -27,6 +30,8 @@ pub mod coefficients;
 pub mod curve;
 pub mod decoder;
 pub mod error;
+#[cfg(feature = "gpu")]
+pub mod gpu;
 pub mod header;
 pub mod idct;
 #[cfg(test)]
@@ -36,6 +41,8 @@ pub mod tile;
 pub use curve::Curve;
 pub use decoder::{Frame, ParsedFrame, decode_frame, parse_frame};
 pub use error::{Error, Result};
+#[cfg(feature = "gpu")]
+pub use gpu::{GpuDecoder, GpuError, GpuFrame};
 pub use header::{BLACK_LEVEL, BayerPattern, Color, Crop, FrameHeader};
 
 /// QuickTime sample description FourCCs of ProRes RAW tracks.

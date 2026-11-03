@@ -14,9 +14,17 @@ publish = false
 default = ["parallel"]
 # Decode tile rows on a rayon thread pool.
 parallel = ["dep:rayon"]
+# Decode on a GPU through wgpu, with a device the caller provides.
+gpu = ["dep:wgpu"]
 
 [dependencies]
 rayon = { version = "1.10", optional = true }
+# Backend-agnostic: the application enables the wgpu backends it wants.
+wgpu = { version = "27", default-features = false, features = ["std", "wgsl"], optional = true }
+
+[dev-dependencies]
+pollster = "0.4"
+wgpu = { version = "27", default-features = false, features = ["std", "wgsl", "vulkan", "metal", "dx12"] }
 
 [lints.rust]
 unsafe_code = "forbid"
