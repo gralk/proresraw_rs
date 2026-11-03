@@ -3,15 +3,30 @@
 //! Fixtures are produced by `tools/make_fixtures.sh` from sample footage
 //! and are not part of the repository. Set `PRORES_RAW_FIXTURES` to the
 //! fixture directory to run these tests; they are skipped otherwise.
-//! Each fixture is a pair `NAME.bin` (one frame packet) and `NAME.raw`
-//! (FFmpeg's `bayer_rggb16le` output, visible size, linearized).
+//! Each fixture is `NAME.bin` (one frame packet), with `NAME.raw`
+//! (FFmpeg's `bayer_rggb16le` output, visible size, linearized) when
+//! FFmpeg can decode it. FFmpeg refuses Bayer codes other than 0, so such
+//! packets come without a reference and are only compared across this
+//! crate's decoders.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use proresraw_rs::decode_frame;
 
 fn fixture_dir() -> Option<PathBuf> {
     std::env::var_os("PRORES_RAW_FIXTURES").map(PathBuf::from)
+}
+
+/// The `.bin` packets of the fixture directory, sorted.
+fn packets(dir: &Path) -> Vec<PathBuf> {
+    let mut packets: Vec<PathBuf> = std::fs::read_dir(dir)
+        .expect("fixture directory")
+        .map(|e| e.expect("entry").path())
+        .filter(|p| p.extension().is_some_and(|e| e == "bin"))
+        .collect();
+    packets.sort();
+    assert!(!packets.is_empty(), "no .bin fixtures in {}", dir.display());
+    packets
 }
 
 #[test]
@@ -20,16 +35,13 @@ fn matches_ffmpeg_linearized_output() {
         eprintln!("PRORES_RAW_FIXTURES not set; skipping the oracle test");
         return;
     };
-    let mut packets: Vec<PathBuf> = std::fs::read_dir(&dir)
-        .expect("fixture directory")
-        .map(|e| e.expect("entry").path())
-        .filter(|p| p.extension().is_some_and(|e| e == "bin"))
-        .collect();
-    packets.sort();
-    assert!(!packets.is_empty(), "no .bin fixtures in {}", dir.display());
-    for packet_path in packets {
+    let mut compared = 0;
+    for packet_path in packets(&dir) {
+        let Ok(reference) = std::fs::read(packet_path.with_extension("raw")) else {
+            continue;
+        };
+        compared += 1;
         let packet = std::fs::read(&packet_path).unwrap();
-        let reference = std::fs::read(packet_path.with_extension("raw")).unwrap();
         let frame = decode_frame(&packet).unwrap();
         let linear = frame.linearize();
         assert_eq!(
@@ -42,6 +54,44 @@ fn matches_ffmpeg_linearized_output() {
             .iter()
             .zip(reference.chunks_exact(2))
             .filter(|(got, want)| **got != u16::from_le_bytes([want[0], want[1]]))
+            .count();
+        assert_eq!(
+            mismatches,
+            0,
+            "{}: {mismatches} sensels differ",
+            packet_path.display()
+        );
+    }
+    assert!(compared > 0, "no fixture has an FFmpeg reference");
+}
+
+#[cfg(feature = "gpu")]
+#[test]
+fn gpu_matches_the_host_on_every_fixture() {
+    let Some(dir) = fixture_dir() else {
+        eprintln!("PRORES_RAW_FIXTURES not set; skipping the GPU fixture test");
+        return;
+    };
+    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::from_env_or_default());
+    let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else {
+        eprintln!("no GPU adapter; skipping the GPU fixture test");
+        return;
+    };
+    let (device, queue) = pollster::block_on(adapter.request_device(&Default::default())).unwrap();
+    let mut decoder = proresraw_rs::GpuDecoder::new(&device);
+    for packet_path in packets(&dir) {
+        let packet = std::fs::read(&packet_path).unwrap();
+        let host = decode_frame(&packet).unwrap();
+        let gpu = decoder
+            .decode(&device, &queue, &packet)
+            .unwrap()
+            .download(&device, &queue)
+            .unwrap();
+        let mismatches = gpu
+            .samples
+            .iter()
+            .zip(&host.samples)
+            .filter(|(a, b)| a != b)
             .count();
         assert_eq!(
             mismatches,
