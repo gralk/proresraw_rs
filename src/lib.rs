@@ -21,6 +21,8 @@
 //! let linear = frame.linearize();
 //! ```
 
+pub mod bits;
+pub mod codebook;
 pub mod curve;
 pub mod error;
 pub mod header;
