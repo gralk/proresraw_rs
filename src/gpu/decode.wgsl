@@ -2,7 +2,7 @@
 //
 // Pass 1, `decode_streams`: one invocation per tile component stream reads
 // its codewords and stores the dequantized, 16-bit-saturated coefficients
-// of its blocks. Pass 2, `transform`: one workgroup per 16x16 sensel square
+// of its blocks into the cleared coefficient buffer. Pass 2, `transform`: one workgroup per 16x16 sensel square
 // inverse-transforms the four blocks of the square and writes its code
 // values. Integer arithmetic wraps, as on the host.
 
@@ -33,8 +33,11 @@ struct Stream {
 @group(0) @binding(1) var<storage, read> packet: array<u32>;
 @group(0) @binding(2) var<storage, read> streams: array<Stream>;
 // Per square: four streams of 64 coefficients, two 16-bit values per word,
-// the even raster index in the low half.
+// the even raster index in the low half. Cleared before the stream pass.
 @group(0) @binding(3) var<storage, read_write> coefs: array<u32>;
+// The same buffer as the stream pass sees it: each coefficient is ORed into
+// its cleared word, which needs no read.
+@group(0) @binding(3) var<storage, read_write> coef_bits: array<atomic<u32>>;
 // Code values, two per word, the even column in the low half.
 @group(0) @binding(4) var<storage, read_write> samples: array<u32>;
 
@@ -121,10 +124,10 @@ fn dequantize(c: i32, q: u32) -> i32 {
 }
 
 // Store coefficient `raster` of the block whose words start at `block`.
+// Each coefficient is stored at most once.
 fn put(block: u32, raster: u32, v: i32) {
-    let i = block + (raster >> 1u);
     let shift = (raster & 1u) * 16u;
-    coefs[i] = (coefs[i] & ~(0xffffu << shift)) | ((u32(v) & 0xffffu) << shift);
+    atomicOr(&coef_bits[block + (raster >> 1u)], (u32(v) & 0xffffu) << shift);
 }
 
 @compute @workgroup_size(64)
@@ -146,12 +149,6 @@ fn decode_streams(
     start_bit = st.offset * 8u;
     pos = 0u;
     limit = st.len * 8u;
-
-    for (var b = 0u; b < blocks; b++) {
-        for (var k = 0u; k < 32u; k++) {
-            coefs[base + b * 128u + k] = 0u;
-        }
-    }
 
     let first = symbol(FIRST_DC);
     if first < 0 {

@@ -222,7 +222,9 @@ impl GpuDecoder {
             streams: Slot::new("prores raw streams", copy_storage),
             coefs: Slot::new(
                 "prores raw coefficients",
-                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_SRC
+                    | wgpu::BufferUsages::COPY_DST,
             ),
         }
     }
@@ -355,6 +357,9 @@ impl GpuDecoder {
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("prores raw decode"),
         });
+        // The stream pass ORs coefficients into zeroed words; one fill is
+        // much cheaper than each invocation zeroing its scattered blocks.
+        encoder.clear_buffer(coefs_buf, 0, Some(layout.coef_bytes()));
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("prores raw streams"),
