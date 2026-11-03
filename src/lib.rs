@@ -21,9 +21,13 @@
 //! let linear = frame.linearize();
 //! ```
 
+pub mod curve;
 pub mod error;
+pub mod header;
 
+pub use curve::Curve;
 pub use error::{Error, Result};
+pub use header::{BLACK_LEVEL, BayerPattern, Color, Crop, FrameHeader};
 
 /// QuickTime sample description FourCCs of ProRes RAW tracks.
 pub const FOURCCS: [&[u8; 4]; 2] = [b"aprn", b"aprh"];
