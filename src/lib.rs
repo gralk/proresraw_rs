@@ -24,6 +24,7 @@
 pub mod curve;
 pub mod error;
 pub mod header;
+pub mod tile;
 
 pub use curve::Curve;
 pub use error::{Error, Result};
