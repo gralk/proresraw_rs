@@ -38,13 +38,57 @@ Demuxing is out of scope: any QuickTime reader that yields samples works.
 - Tile rows decode in parallel on rayon (feature `parallel`, on by
   default). A 5.8K frame decodes in about 45 ms on a desktop CPU.
 
+## GPU decoding
+
+With the `gpu` feature, `GpuDecoder` decodes on a wgpu device the
+application provides, bit-exactly with the host decoder. The output stays
+on the GPU in a storage buffer, ready for the next compute stage:
+
+```rust
+let mut decoder = proresraw_rs::GpuDecoder::new(&device);
+let header = proresraw_rs::parse_frame(&packet)?.header;
+let samples = device.create_buffer(&wgpu::BufferDescriptor {
+    label: None,
+    size: proresraw_rs::gpu::sample_bytes(&header),
+    usage: wgpu::BufferUsages::STORAGE,
+    mapped_at_creation: false,
+});
+decoder.decode_into(&device, &queue, &packet, &samples)?;
+```
+
+The buffer holds the code values of the coded picture (width and height
+rounded up to 16), row-major, two per 32-bit word with the even column in
+the low half. `GpuFrame::download` copies a frame back as a host `Frame`.
+The crate enables no wgpu backend itself; the application chooses them.
+
+The host parses and validates the frame and tile headers and uploads the
+packet with a table of component streams. One compute pass decodes each
+stream on its own invocation and stores dequantized coefficients; a
+second runs the integer inverse transform per 16×16 sensel square.
+
+Steady-state time per frame on an RTX 3060 (upload included) against the
+parallel host decoder on the same machine:
+
+| clip | size | GPU | host |
+|---|---|---|---|
+| Panasonic S5 via Atomos, HQ | 5888×3312 | 14.7 ms | 32.6 ms |
+| Sony a7S III via Atomos, HQ | 4264×2408 | 6.1 ms | 23.8 ms |
+| Sony FX6 via Ninja V | 3872×2192 | 3.0 ms | 14.7 ms |
+| iPhone 17 Pro, HQ | 4224×3024 | 11.4 ms | 23.7 ms |
+
+Entropy decoding is serial within a stream and dominates the GPU time.
+
 ## Design
 
 `docs/bitstream.md` is the format description the code is written from.
 The modules follow it: `header` (§3), `tile` (§4–5), `bits` and
 `codebook` (§6.1), `coefficients` (§6.2–6.4), `idct` (§7), `curve`
-(§8) and `decoder` (§2, placement). No unsafe code.
+(§8) and `decoder` (§2, placement). `gpu` and `gpu/decode.wgsl` mirror
+§6–7 on the GPU; the shader's tables are generated from `codebook`. No
+unsafe code.
 
+Random frames from `synth` (every alignment and Bayer pattern, extreme
+quantizers) must decode identically on the host and the GPU.
 `tests/oracle.rs` compares against FFmpeg's `prores_raw` decoder when
 `PRORES_RAW_FIXTURES` points at fixtures made by a tool outside the
 repository; it is skipped otherwise. The FFmpeg build must have x86
