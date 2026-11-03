@@ -23,6 +23,7 @@
 
 pub mod bits;
 pub mod codebook;
+pub mod coefficients;
 pub mod curve;
 pub mod error;
 pub mod header;
