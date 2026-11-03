@@ -82,7 +82,8 @@ pub fn decode_component(data: &[u8], log2_blocks: u8, coefs: &mut [i32]) {
     }
 }
 
-/// Level symbol and sign bit to coefficient value.
+/// Level symbol and sign bit to coefficient value. Symbols are below
+/// 2^24 (a codeword fits the 32-bit window), so the magnitude fits.
 fn signed(level: u32, sign_bit: u32) -> i32 {
     let magnitude = level as i32 + 1;
     if sign_bit != 0 { -magnitude } else { magnitude }

@@ -10,11 +10,18 @@ const W7: i32 = 4520;
 const ROW_SHIFT: u32 = 13;
 const COL_SHIFT: u32 = 15;
 
+/// Dequantized coefficient: the exact product saturated to 16 bits.
+/// Symbols stay below 2^24 and quantizers below 2^16, so the product
+/// always fits in 64 bits.
+pub fn dequantize(coef: i32, q: i32) -> i32 {
+    (i64::from(coef) * i64::from(q)).clamp(-32768, 32767) as i32
+}
+
 /// Dequantize one raster-order block in place and replace it with the
 /// centered sensel values of its inverse transform.
 pub fn inverse_transform(block: &mut [i32; 64], qmat: &[i32; 64]) {
     for (c, &q) in block.iter_mut().zip(qmat) {
-        *c = (*c * q).clamp(-32768, 32767);
+        *c = dequantize(*c, q);
     }
     for row in block.chunks_exact_mut(8) {
         transform_row(row);
@@ -176,6 +183,22 @@ mod tests {
         sat[0] = 32767;
         inverse_transform(&mut sat, &ONES);
         assert_eq!(b, sat);
+    }
+
+    #[test]
+    fn dequantizes_large_products_without_overflow() {
+        // A symbol can reach 2^23 and a quantizer 255 * 255; the product
+        // exceeds i32 and must still saturate.
+        let mut b = [0i32; 64];
+        b[0] = 1 << 23;
+        b[1] = -(1 << 23);
+        let q = [65025; 64];
+        let mut expected = [0i32; 64];
+        expected[0] = 32767;
+        expected[1] = -32768;
+        inverse_transform(&mut expected, &ONES);
+        inverse_transform(&mut b, &q);
+        assert_eq!(b, expected);
     }
 
     #[test]

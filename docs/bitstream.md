@@ -195,6 +195,11 @@ exponential-Golomb hybrid code described by a 12-bit parameter
   stops and all remaining coefficients are zero. No valid codeword is
   longer than 32 bits.
 
+Because a codeword fits the window, its exp-Golomb prefix has at most
+`32 - q` significant bits with `q > s`, and orders are at most 15, so
+every symbol is below 2²⁴. Coefficients therefore fit comfortably in 32
+bits, while their dequantized products (§7) may not.
+
 ### 6.2 Coefficient order
 
 Coefficients of all `nb_blocks` blocks of the component are interleaved
@@ -280,6 +285,9 @@ Scan index to raster index (row-major 8×8), the ProRes interlaced scan:
 For each block, in raster coefficient order:
 
 `d[i] = clamp(coef[i] * qmat[i] * qscale, -32768, 32767)`
+
+computed exactly: the product of a coefficient (below 2²⁴) and a
+quantizer (up to 255 × 255) can exceed 32 bits before saturating.
 
 followed by a separable integer 8×8 inverse DCT with 32-bit
 intermediates, the "simple IDCT" with constants
