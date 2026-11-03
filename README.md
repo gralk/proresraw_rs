@@ -31,8 +31,10 @@ Demuxing is out of scope: any QuickTime reader that yields samples works.
   matrices and linearization curves are handled.
 - RGGB and BGGR frames verified; GRBG and GBRG follow the same rule but
   no sample has been seen.
-- Output matches an Apple-decoded DNG conversion of an Atomos clip to
-  within the DNG's 12-bit quantization.
+- Bit-exact with FFmpeg master's C `prores_raw` decoder on seven Atomos
+  clips (`aprn` and `aprh`, partial edge tiles, qscale 15 and 45), and
+  matches an Apple-decoded DNG conversion of one of them to within the
+  DNG's 12-bit quantization.
 - Tile rows decode in parallel on rayon (feature `parallel`, on by
   default). A 5.8K frame decodes in about 45 ms on a desktop CPU.
 
@@ -45,7 +47,9 @@ The modules follow it: `header` (§3), `tile` (§4–5), `bits` and
 
 `tests/oracle.rs` compares against FFmpeg's `prores_raw` decoder when
 `PRORES_RAW_FIXTURES` points at fixtures made by a tool outside the
-repository; it is skipped otherwise.
+repository; it is skipped otherwise. The FFmpeg build must have x86
+assembly disabled: with AVX2 its Bayer path inherits a transposed IDCT
+permutation and every block comes out transposed.
 
 ## License
 
