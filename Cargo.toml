@@ -1,0 +1,20 @@
+[package]
+name = "proresraw_rs"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+description = "Pure-Rust Apple ProRes RAW decoder: Bayer sensel code values plus the camera metadata needed to linearize them"
+repository = "https://github.com/gralk/proresraw_rs"
+keywords = ["multimedia", "video", "prores", "raw", "bayer"]
+categories = ["multimedia::encoding", "multimedia::video"]
+publish = false
+
+[dependencies]
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[lints.clippy]
+all = "warn"
