@@ -25,12 +25,14 @@ pub mod bits;
 pub mod codebook;
 pub mod coefficients;
 pub mod curve;
+pub mod decoder;
 pub mod error;
 pub mod header;
 pub mod idct;
 pub mod tile;
 
 pub use curve::Curve;
+pub use decoder::{Frame, ParsedFrame, decode_frame, parse_frame};
 pub use error::{Error, Result};
 pub use header::{BLACK_LEVEL, BayerPattern, Color, Crop, FrameHeader};
 
