@@ -74,10 +74,14 @@ nothing extra) are ignored.
 
 ### 3.1 Bayer pattern
 
-Value 0 is RGGB: the sensel at even row, even column is red, the two
-odd-parity positions are green, odd row and odd column is blue. Values
-1 to 3 are alternates in the usual RGGB/GRBG/GBRG/BGGR enumeration.
-Every Atomos clip observed uses 0; the iPhone 17 writes 3.
+The usual enumeration: 0 RGGB (red at even row, even column), 1 GRBG,
+2 GBRG, 3 BGGR. The pattern decides where the four colour-ordered
+component streams of every tile land (§5). Every Atomos clip observed
+uses 0, confirmed RGGB by an Assimilate DNG conversion; the iPhone 17
+writes 3, confirmed BGGR by colour rendering through the header matrix
+and by sub-sensel phase correlation of the decoded phases (see
+`footage-survey.md`). Codes 1 and 2 follow the same rule but no sample
+has been seen.
 
 ### 3.2 Levels
 
@@ -148,14 +152,20 @@ tile
 Observed `header_len` is 8. A negative derived fourth size is an error.
 
 The four streams carry the four Bayer phases, one 8×8 block per 16×16
-sensel square. Stream order maps to phase (row parity, column parity):
+sensel square. The streams are colour-ordered: green, green, blue, red.
+With the red sensel of the pattern at `(r, c)` (row parity, column
+parity), the streams land on:
 
-| stream | phase (row, col) | RGGB meaning |
-|---:|---|---|
-| 0 | (1, 0) | green |
-| 1 | (0, 1) | green |
-| 2 | (1, 1) | blue |
-| 3 | (0, 0) | red |
+| stream | colour | phase | RGGB | BGGR |
+|---:|---|---|---|---|
+| 0 | green | (1−r, c) | (1, 0) | (0, 1) |
+| 1 | green | (r, 1−c) | (0, 1) | (1, 0) |
+| 2 | blue | (1−r, 1−c) | (1, 1) | (0, 0) |
+| 3 | red | (r, c) | (0, 0) | (1, 1) |
+
+Placing the streams of a BGGR frame as if it were RGGB gives the right
+colours per stream but shifts every sample one sensel diagonally, which
+phase correlation against the green average detects.
 
 A tile with `log2_nb_blocks = e` holds `nb_blocks = 1 << e` blocks per
 component, block `b` covering sensel columns `16b .. 16b+15` of the tile.

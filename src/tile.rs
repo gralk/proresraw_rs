@@ -111,13 +111,11 @@ impl TileGrid {
 pub struct Tile<'a> {
     /// Quantizer scale multiplying the frame's quantization matrix.
     pub qscale: u8,
-    /// Entropy-coded coefficient streams, in stored order (see
-    /// [`STREAM_PHASES`] for which Bayer phase each one carries).
+    /// Entropy-coded coefficient streams in stored order: green, green,
+    /// blue, red (see [`crate::header::BayerPattern::stream_phases`] for
+    /// where each one lands).
     pub streams: [&'a [u8]; 4],
 }
-
-/// Bayer phase (row parity, column parity) carried by each tile stream.
-pub const STREAM_PHASES: [(usize, usize); 4] = [(1, 0), (0, 1), (1, 1), (0, 0)];
 
 impl<'a> Tile<'a> {
     /// Split a tile payload into its header and component streams.

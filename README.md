@@ -29,9 +29,12 @@ Demuxing is out of scope: any QuickTime reader that yields samples works.
 - Bitstream versions 0 (Atomos recorders) and 1 (iPhone 17) decode.
 - Tile alignments 0 to 4, partial edge tiles, custom quantization
   matrices and linearization curves are handled.
-- Only RGGB frames (Bayer code 0) are verified.
+- RGGB and BGGR frames verified; GRBG and GBRG follow the same rule but
+  no sample has been seen.
 - Output matches an Apple-decoded DNG conversion of an Atomos clip to
   within the DNG's 12-bit quantization.
+- Tile rows decode in parallel on rayon (feature `parallel`, on by
+  default). A 5.8K frame decodes in about 45 ms on a desktop CPU.
 
 ## Design
 

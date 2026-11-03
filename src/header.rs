@@ -71,6 +71,16 @@ impl BayerPattern {
         }
     }
 
+    /// Bayer phase (row parity, column parity) that each of a tile's four
+    /// streams lands on. The streams are colour-ordered: the first two are
+    /// green, the third blue, the fourth red. Relative to the red sensel
+    /// at `(r, c)`, they sit at `(1-r, c)`, `(r, 1-c)`, `(1-r, 1-c)` and
+    /// `(r, c)`.
+    pub fn stream_phases(self) -> [(usize, usize); 4] {
+        let (r, c) = self.red_position();
+        [(1 - r, c), (r, 1 - c), (1 - r, 1 - c), (r, c)]
+    }
+
     /// Colour of the sensel at the given coordinates.
     pub fn color_at(self, row: usize, col: usize) -> Color {
         let (red_row, red_col) = self.red_position();
@@ -378,6 +388,38 @@ mod tests {
         assert_eq!(grid(BayerPattern::Bggr), [Blue, Green, Green, Red]);
         for code in 0..4 {
             assert_eq!(BayerPattern::from_code(code).code(), code);
+        }
+    }
+
+    #[test]
+    fn stream_phases_follow_the_pattern() {
+        assert_eq!(
+            BayerPattern::Rggb.stream_phases(),
+            [(1, 0), (0, 1), (1, 1), (0, 0)]
+        );
+        assert_eq!(
+            BayerPattern::Bggr.stream_phases(),
+            [(0, 1), (1, 0), (0, 0), (1, 1)]
+        );
+        assert_eq!(
+            BayerPattern::Grbg.stream_phases(),
+            [(1, 1), (0, 0), (1, 0), (0, 1)]
+        );
+        assert_eq!(
+            BayerPattern::Gbrg.stream_phases(),
+            [(0, 0), (1, 1), (0, 1), (1, 0)]
+        );
+        for p in [
+            BayerPattern::Rggb,
+            BayerPattern::Grbg,
+            BayerPattern::Gbrg,
+            BayerPattern::Bggr,
+        ] {
+            let [g0, g1, b, r] = p.stream_phases();
+            assert_eq!(p.color_at(g0.0, g0.1), Color::Green);
+            assert_eq!(p.color_at(g1.0, g1.1), Color::Green);
+            assert_eq!(p.color_at(b.0, b.1), Color::Blue);
+            assert_eq!(p.color_at(r.0, r.1), Color::Red);
         }
     }
 

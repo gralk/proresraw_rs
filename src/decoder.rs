@@ -5,7 +5,7 @@ use crate::coefficients::{MAX_BLOCKS, decode_component};
 use crate::error::{Error, Result};
 use crate::header::{FrameHeader, MIN_HEADER_SIZE};
 use crate::idct::{code_value, inverse_transform};
-use crate::tile::{STREAM_PHASES, TILE_UNIT, Tile, TileGeometry, TileGrid};
+use crate::tile::{TILE_UNIT, Tile, TileGeometry, TileGrid};
 
 /// Byte length of the frame prefix: size, tag and header size.
 const PREFIX_LEN: usize = 10;
@@ -141,6 +141,7 @@ pub fn decode_frame(packet: &[u8]) -> Result<Frame> {
     let tile_rows = samples.chunks_exact_mut(stride * TILE_UNIT);
     let payload_rows = parsed.tiles.chunks_exact(per_row);
     let qmat = &header.quant_matrix;
+    let phases = header.bayer_pattern.stream_phases();
     let decode_row = |(tile_row, (rows, payloads)): (usize, (&mut [u16], &[&[u8]]))| {
         let geometry = parsed.grid.row(tile_row);
         let first_index = tile_row * per_row;
@@ -149,7 +150,7 @@ pub fn decode_frame(packet: &[u8]) -> Result<Frame> {
             .enumerate()
             .try_for_each(|(i, (geometry, payload))| {
                 let tile = Tile::parse(payload, first_index + i)?;
-                decode_tile(&tile, geometry, qmat, rows, stride);
+                decode_tile(&tile, geometry, qmat, phases, rows, stride);
                 Ok(())
             })
     };
@@ -167,11 +168,13 @@ pub fn decode_frame(packet: &[u8]) -> Result<Frame> {
     Ok(Frame { header, samples })
 }
 
-/// Decode one tile into `rows`, the 16 sensel rows of its tile row.
+/// Decode one tile into `rows`, the 16 sensel rows of its tile row,
+/// placing each stream on its Bayer phase.
 fn decode_tile(
     tile: &Tile<'_>,
     geometry: TileGeometry,
     qmat: &[u8; 64],
+    phases: [(usize, usize); 4],
     rows: &mut [u16],
     stride: usize,
 ) {
@@ -182,7 +185,7 @@ fn decode_tile(
     let blocks = geometry.blocks();
     let mut coefs = [0i32; 64 * MAX_BLOCKS];
     let coefs = &mut coefs[..64 * blocks];
-    for (stream, &(phase_row, phase_col)) in tile.streams.iter().zip(&STREAM_PHASES) {
+    for (stream, (phase_row, phase_col)) in tile.streams.iter().zip(phases) {
         decode_component(stream, geometry.log2_blocks, coefs);
         for (b, block) in coefs.chunks_exact_mut(64).enumerate() {
             let block: &mut [i32; 64] = block.try_into().expect("64 coefficients");
