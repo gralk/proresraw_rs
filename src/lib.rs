@@ -29,6 +29,8 @@ pub mod decoder;
 pub mod error;
 pub mod header;
 pub mod idct;
+#[cfg(test)]
+pub(crate) mod synth;
 pub mod tile;
 
 pub use curve::Curve;
