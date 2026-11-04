@@ -16,7 +16,8 @@ default = ["parallel"]
 parallel = ["dep:rayon"]
 # Decode on a GPU through wgpu, with a device the caller provides.
 gpu = ["dep:wgpu"]
-# Dev only: expose the IDCT test-block generator to external test tooling.
+# Dev only: expose the IDCT test-block generator and the synthetic frame
+# generator (`synth`) to external test tooling.
 testgen = []
 
 [dependencies]

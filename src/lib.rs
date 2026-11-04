@@ -34,8 +34,9 @@ pub mod error;
 pub mod gpu;
 pub mod header;
 pub mod idct;
-#[cfg(test)]
-pub(crate) mod synth;
+/// Synthetic frames for decoder tests, exposed with the `testgen` feature.
+#[cfg(any(test, feature = "testgen"))]
+pub mod synth;
 pub mod tile;
 
 pub use curve::Curve;
