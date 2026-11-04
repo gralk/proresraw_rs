@@ -39,11 +39,12 @@ pub(crate) mod synth;
 pub mod tile;
 
 pub use curve::Curve;
-pub use decoder::{Frame, ParsedFrame, decode_frame, parse_frame};
+pub use decoder::{Frame, ParsedFrame, decode_frame, decode_frame_with, parse_frame};
 pub use error::{Error, Result};
 #[cfg(feature = "gpu")]
 pub use gpu::{GpuDecoder, GpuError, GpuFrame};
 pub use header::{BLACK_LEVEL, BayerPattern, Color, Crop, FrameHeader};
+pub use idct::Idct;
 
 /// QuickTime sample description FourCCs of ProRes RAW tracks.
 pub const FOURCCS: [&[u8; 4]; 2] = [b"aprn", b"aprh"];

@@ -2,15 +2,17 @@
 //
 // Pass 1, `decode_streams`: one invocation per tile component stream reads
 // its codewords and stores the dequantized, 16-bit-saturated coefficients
-// of its blocks into the cleared coefficient buffer. Pass 2, `transform`: one workgroup per 16x16 sensel square
-// inverse-transforms the four blocks of the square and writes its code
-// values. Integer arithmetic wraps, as on the host.
+// of its blocks into the cleared coefficient buffer, bit-exactly with the
+// host. Pass 2, `transform`: one workgroup per 16x16 sensel square
+// inverse-transforms the four blocks of the square with the Apple-compatible transform
+// and writes its code values. Integer arithmetic wraps, as on the host.
 
 struct Params {
     squares_x: u32,
     squares_y: u32,
     streams: u32,
-    _pad: u32,
+    // Always 0; see `rounded`.
+    zero: u32,
     // Stored stream index of each Bayer phase, indexed by row parity * 2 + column parity.
     phase_stream: array<u32, 4>,
     qmat: array<u32, 64>,
@@ -40,14 +42,26 @@ struct Stream {
 @group(0) @binding(3) var<storage, read_write> coef_bits: array<atomic<u32>>;
 // Code values, two per word, the even column in the low half.
 @group(0) @binding(4) var<storage, read_write> samples: array<u32>;
+// One bit per square: set when its tile was skipped for an invalid header.
+@group(0) @binding(5) var<storage, read> skipped: array<u32>;
 
 // TABLES
 
 // --- Pass 1: entropy decoding -------------------------------------------
+//
+// The bit reader and codeword decoder match src/bits.rs: a 64-bit window,
+// here two words, whose top 32 bits are the current view, refilled one
+// big-endian word at a time. Invalid (over-long) codewords wrap exactly as
+// on the host.
 
-var<private> start_bit: u32;
-var<private> pos: u32;
-var<private> limit: u32;
+var<private> win_hi: u32;
+var<private> win_lo: u32;
+// Valid bits below the top 32; negative after an over-long codeword.
+var<private> extra: i32;
+// Next byte to load, end of whole words, end of the stream (packet offsets).
+var<private> bpos: u32;
+var<private> words_end: u32;
+var<private> bend: u32;
 
 // Word `i` of the packet read as a big-endian 32-bit value.
 fn be_word(i: u32) -> u32 {
@@ -55,72 +69,121 @@ fn be_word(i: u32) -> u32 {
     return (w >> 24u) | ((w >> 8u) & 0xff00u) | ((w << 8u) & 0xff0000u) | (w << 24u);
 }
 
-// The next 32 bits of the stream, zero-filled past its end.
-fn window() -> u32 {
-    if pos >= limit {
-        return 0u;
-    }
-    let bit = start_bit + pos;
-    let i = bit >> 5u;
-    let shift = bit & 31u;
-    var w = be_word(i) << shift;
-    if shift != 0u {
-        w |= be_word(i + 1u) >> (32u - shift);
-    }
-    let left = limit - pos;
-    if left < 32u {
-        w &= 0xffffffffu << (32u - left);
+fn byte_at(i: u32) -> u32 {
+    return (packet[i >> 2u] >> ((i & 3u) * 8u)) & 0xffu;
+}
+
+// Up to four bytes from `p` as the top bytes of a big-endian word.
+fn partial_word(p: u32, n: u32) -> u32 {
+    var w = 0u;
+    for (var i = 0u; i < min(n, 4u); i++) {
+        w |= byte_at(p + i) << (24u - 8u * i);
     }
     return w;
 }
 
-fn read_bit() -> u32 {
-    let b = window() >> 31u;
-    pos += 1u;
-    return b;
+// Set up the reader on `len` bytes at packet offset `offset`. The packet
+// is taken as 4-byte aligned, as on the host.
+fn reader_init(offset: u32, len: u32) {
+    var p = offset;
+    var remaining = len;
+    if remaining < 4u {
+        win_hi = partial_word(p, remaining);
+        p += remaining;
+        remaining = 0u;
+    } else {
+        win_hi = partial_word(p, 4u);
+        p += 4u;
+        remaining -= 4u;
+    }
+    win_lo = 0u;
+    extra = 0;
+    let to_boundary = (4u - (p & 3u)) & 3u;
+    if to_boundary != 0u && to_boundary <= remaining {
+        win_lo = partial_word(p, to_boundary);
+        p += to_boundary;
+        remaining -= to_boundary;
+        extra = i32(8u * to_boundary);
+    }
+    bpos = p;
+    words_end = p + 4u * (remaining / 4u);
+    bend = offset + len;
 }
 
-// One symbol of the hybrid code with parameters `cb`, or -1 at the end of
-// the component.
-fn symbol(cb: u32) -> i32 {
-    let w = window();
-    if w == 0u {
-        return -1;
+// Next refill: a whole (aligned) word, else the zero-filled tail.
+fn next_word() -> u32 {
+    if bpos < words_end {
+        let w = be_word(bpos >> 2u);
+        bpos += 4u;
+        return w;
     }
-    let q = countLeadingZeros(w);
-    let s = cb >> 8u;
-    let e = (cb >> 4u) & 15u;
-    let r = cb & 15u;
-    if q <= s {
-        var tail = 0u;
-        if r != 0u {
-            tail = (w << (q + 1u)) >> (32u - r);
+    let w = partial_word(bpos, bend - bpos);
+    bpos = bend;
+    return w;
+}
+
+// Drop `len` bits, refilling at most once.
+fn consume(len: u32) {
+    let s = len & 63u;
+    if s >= 32u {
+        win_hi = win_lo << (s - 32u);
+        win_lo = 0u;
+    } else if s != 0u {
+        win_hi = (win_hi << s) | (win_lo >> (32u - s));
+        win_lo = win_lo << s;
+    }
+    extra -= i32(len);
+    if extra < 0 {
+        // The refill position uses the low byte of the count, sign-extended.
+        let shift = u32(-((extra << 24u) >> 24u)) & 63u;
+        let w = next_word();
+        if shift >= 32u {
+            win_hi |= w << (shift - 32u);
+        } else if shift == 0u {
+            win_lo |= w;
+        } else {
+            win_hi |= w >> (32u - shift);
+            win_lo |= w << shift;
         }
-        pos += q + 1u + r;
-        return i32((q << r) | tail);
+        extra += 32;
     }
-    let len = 2u * q + e - s;
-    if len > 32u {
-        return -1;
-    }
-    pos += len;
-    return i32((w >> (32u - len)) + ((s + 1u) << r) - (1u << e));
 }
 
-// The exact product saturated to 16 bits. Coefficients stay below 2^24
-// and quantizers below 2^16, so saturating the coefficient first keeps the
-// 32-bit product in range.
+// Codeword decoder on a non-zero view `p`: (value, length).
+fn codeword(p: u32, cb: u32) -> vec2<u32> {
+    let lz = countLeadingZeros(p);
+    let s = cb >> 8u;
+    let r = cb & 15u;
+    if (p & 0x80000000u) != 0u {
+        return vec2<u32>((p & 0x7fffffffu) >> ((31u - r) & 31u), r + 1u);
+    }
+    if lz <= s {
+        let tail = ((p << ((lz + 1u) & 31u)) >> 1u) >> ((31u - r) & 31u);
+        return vec2<u32>((lz << r) + tail, r + 1u + lz);
+    }
+    let e = (cb >> 4u) & 15u;
+    let len = 2u * lz - s + e;
+    return vec2<u32>(((s + 1u) << r) + (p >> ((32u - len) & 31u)) - (1u << e), len);
+}
+
+// A 16-bit coefficient (sign-extended) times the quantizer, saturated to
+// 16 bits. Quantizers are at most 63 * 255, so the product fits.
 fn dequantize(c: i32, q: u32) -> i32 {
-    if q == 0u {
-        return 0;
+    let c16 = (c << 16u) >> 16u;
+    return clamp(c16 * i32(q), -32768, 32767);
+}
+
+// Read a level codeword and its sign bit: (symbol, signed 16-bit value).
+fn level(cb: u32) -> vec2<i32> {
+    let top = win_hi;
+    let cw = codeword(top, cb);
+    let negative = ((top << (cw.y & 31u)) >> 31u) != 0u;
+    consume(cw.y + 1u);
+    var magnitude = i32((cw.x + 1u) & 0xffffu);
+    if negative {
+        magnitude = -magnitude;
     }
-    if c > 32767 {
-        return 32767;
-    }
-    if c < -32768 {
-        return -32768;
-    }
-    return clamp(c * i32(q), -32768, 32767);
+    return vec2<i32>(bitcast<i32>(cw.x), magnitude);
 }
 
 // Store coefficient `raster` of the block whose words start at `block`.
@@ -146,36 +209,31 @@ fn decode_streams(
     let codes = 64u * blocks;
     let block_mask = blocks - 1u;
     let base = st.square * 128u + (st.info >> 16u) * 32u;
-    start_bit = st.offset * 8u;
-    pos = 0u;
-    limit = st.len * 8u;
+    reader_init(st.offset, st.len);
 
-    let first = symbol(FIRST_DC);
-    if first < 0 {
+    // DC: a sign-folded first value, then deltas with a running sign.
+    if win_hi == 0u {
         return;
     }
     let q0 = params.qmat[0] * qscale;
-    var dc = (first >> 1u) ^ -(first & 1);
+    let first = codeword(win_hi, FIRST_DC);
+    consume(first.y);
+    let odd = first.x & 1u;
+    var dc = bitcast<i32>((((odd + first.x) >> 1u) ^ (0u - odd)) + odd);
     put(base, 0u, dequantize(dc, q0));
-    var prev = u32(first);
-    var sign = 0;
+    var dc_cb = DC_RESET;
+    var sign = 0u;
     for (var b = 1u; b < blocks; b++) {
-        var cb = DC_RESET;
-        if b % 16u != 1u {
-            cb = DC_CB[min((prev + 1u) >> 1u, 12u)];
-        }
-        let v = symbol(cb);
-        if v < 0 {
+        if win_hi == 0u {
             return;
         }
-        prev = u32(v);
-        sign ^= v & 1;
-        let magnitude = (v + 1) >> 1u;
-        var delta = magnitude;
-        if sign != 0 {
-            delta = -magnitude;
-        }
-        sign = select(0, 1, delta < 0);
+        let cw = codeword(win_hi, dc_cb);
+        sign ^= cw.x & 1u;
+        let magnitude = ((cw.x & 1u) + cw.x) >> 1u;
+        let delta = bitcast<i32>(((0u - sign) ^ magnitude) + sign);
+        dc_cb = DC_CB[min(magnitude, 12u)];
+        sign = select(0u, 1u, delta < 0);
+        consume(cw.y);
         dc += delta;
         put(base + b * 128u, 0u, dequantize(dc, q0));
     }
@@ -184,102 +242,146 @@ fn decode_streams(
     var rn_cb = RN_INITIAL;
     var ln_cb = LN_INITIAL;
     var n = blocks;
-    loop {
-        if n >= codes {
-            return;
-        }
-        let run = symbol(ln_cb);
-        if run < 0 {
-            return;
-        }
-        for (var i = 0; i < run; i++) {
-            let level = symbol(ac_cb);
-            if level < 0 {
+    if n >= codes {
+        return;
+    }
+    while win_hi != 0u {
+        let run = codeword(win_hi, ln_cb);
+        consume(run.y);
+        for (var i = 0u; i < run.x; i++) {
+            if win_hi == 0u {
                 return;
             }
-            ac_cb = AC_CB[min(u32(level), 94u)];
+            let lv = level(ac_cb);
+            ac_cb = AC_CB[min(u32(lv.x), 94u)];
             let raster = SCAN[n >> log2];
-            var c = level + 1;
-            if read_bit() != 0u {
-                c = -c;
-            }
-            put(base + (n & block_mask) * 128u, raster, dequantize(c, params.qmat[raster] * qscale));
+            put(base + (n & block_mask) * 128u, raster, dequantize(lv.y, params.qmat[raster] * qscale));
             n++;
             if n == codes {
                 return;
             }
         }
-        let zeros = symbol(rn_cb);
-        if zeros < 0 {
+        if win_hi == 0u {
             return;
         }
-        rn_cb = RN_CB[min(u32(zeros), 27u)];
-        // A zero run is zeros + 1 long; symbols are below 2^24, so this
-        // cannot overflow.
-        n += u32(zeros) + 1u;
+        let zeros = codeword(win_hi, rn_cb);
+        rn_cb = RN_CB[min(zeros.x, 27u)];
+        consume(zeros.y);
+        n = n + 1u + zeros.x;
+        if n >= codes || win_hi == 0u {
+            return;
+        }
+        let lv = level(ac_cb);
+        ac_cb = AC_CB[min(u32(lv.x), 94u)];
+        ln_cb = LN_CB[min(u32(lv.x), 14u)];
+        let raster = SCAN[n >> log2];
+        put(base + (n & block_mask) * 128u, raster, dequantize(lv.y, params.qmat[raster] * qscale));
+        n++;
         if n >= codes {
             return;
         }
-        let level = symbol(ac_cb);
-        if level < 0 {
-            return;
-        }
-        ac_cb = AC_CB[min(u32(level), 94u)];
-        ln_cb = LN_CB[min(u32(level), 14u)];
-        let raster = SCAN[n >> log2];
-        var c = level + 1;
-        if read_bit() != 0u {
-            c = -c;
-        }
-        put(base + (n & block_mask) * 128u, raster, dequantize(c, params.qmat[raster] * qscale));
-        n++;
     }
 }
 
 // --- Pass 2: inverse transform ------------------------------------------
+//
+// The Apple-compatible transform (see src/idct.rs): an integer row pass with
+// per-row prescaled tables, then an f32 column pass. The int-to-float
+// conversion rounds to nearest-even in integer code, since WGSL leaves its
+// rounding to the implementation; the float operations follow the host's
+// order, and every product is forced to round on its own (see `rounded`)
+// so that no multiply-add is fused. WGSL does not promise correctly
+// rounded f32 arithmetic, so other devices may still differ by a code
+// value in rare cases.
 
-const W1 = 22725;
-const W2 = 21407;
-const W3 = 19265;
-const W4 = 16384;
-const W5 = 12873;
-const W6 = 8867;
-const W7 = 4520;
+// The four blocks of a square, stream-major, raster order: row-pass output
+// as f32 bits, then code values.
+var<workgroup> blocks: array<u32, 256>;
 
-// The four blocks of a square, stream-major, raster order.
-var<workgroup> blocks: array<i32, 256>;
+// i32 to f32, rounding to nearest-even like the host's conversion.
+fn to_f32(x: i32) -> f32 {
+    if x == 0 {
+        return 0.0;
+    }
+    let ux = bitcast<u32>(x);
+    let a = select(ux, 0u - ux, x < 0);
+    var e = 31u - countLeadingZeros(a);
+    var mant: u32;
+    if e <= 23u {
+        mant = a << (23u - e);
+    } else {
+        let shift = e - 23u;
+        mant = a >> shift;
+        let rem = a & ((1u << shift) - 1u);
+        let half = 1u << (shift - 1u);
+        if rem > half || (rem == half && (mant & 1u) == 1u) {
+            mant += 1u;
+            if mant == (1u << 24u) {
+                mant >>= 1u;
+                e += 1u;
+            }
+        }
+    }
+    return bitcast<f32>((ux & 0x80000000u) | ((e + 127u) << 23u) | (mant & 0x7fffffu));
+}
 
-// One 8-point pass of the integer transform on `x`, with `round` folded
-// into the DC term and outputs shifted right by `shift`.
-fn idct8(x: array<i32, 8>, round: i32, shift: u32) -> array<i32, 8> {
-    let base = W4 * x[0] + round;
-    let a0 = base + W2 * x[2] + W4 * x[4] + W6 * x[6];
-    let a1 = base + W6 * x[2] - W4 * x[4] - W2 * x[6];
-    let a2 = base - W6 * x[2] - W4 * x[4] + W2 * x[6];
-    let a3 = base - W2 * x[2] + W4 * x[4] - W6 * x[6];
-    let b0 = W1 * x[1] + W3 * x[3] + W5 * x[5] + W7 * x[7];
-    let b1 = W3 * x[1] - W7 * x[3] - W1 * x[5] - W5 * x[7];
-    let b2 = W5 * x[1] - W1 * x[3] + W7 * x[5] + W3 * x[7];
-    let b3 = W7 * x[1] - W5 * x[3] + W3 * x[5] - W1 * x[7];
+// Row `k` of a block: eight int32 outputs, no rounding or shift.
+fn row_pass(x: array<i32, 8>, k: u32) -> array<i32, 8> {
+    let t = ROW_SET[k] * 32u;
+    var even: array<i32, 4>;
+    var odd: array<i32, 4>;
+    for (var j = 0u; j < 4u; j++) {
+        even[j] = x[0] * ROW_TABLES[t + 2u * j] + x[2] * ROW_TABLES[t + 2u * j + 1u]
+            + x[4] * ROW_TABLES[t + 8u + 2u * j] + x[6] * ROW_TABLES[t + 8u + 2u * j + 1u];
+        odd[j] = x[1] * ROW_TABLES[t + 16u + 2u * j] + x[3] * ROW_TABLES[t + 16u + 2u * j + 1u]
+            + x[5] * ROW_TABLES[t + 24u + 2u * j] + x[7] * ROW_TABLES[t + 24u + 2u * j + 1u];
+    }
     return array<i32, 8>(
-        (a0 + b0) >> shift,
-        (a1 + b1) >> shift,
-        (a2 + b2) >> shift,
-        (a3 + b3) >> shift,
-        (a3 - b3) >> shift,
-        (a2 - b2) >> shift,
-        (a1 - b1) >> shift,
-        (a0 - b0) >> shift,
+        even[0] + odd[0], even[1] + odd[1], even[2] + odd[2], even[3] + odd[3],
+        even[3] - odd[3], even[2] - odd[2], even[1] - odd[1], even[0] - odd[0],
     );
 }
 
-fn code_value(centered: i32) -> u32 {
-    return u32(clamp(centered + 32768, 0, 65535));
+// `x` unchanged, but opaque to the compiler: XOR with a zero it cannot
+// see keeps a product from being fused with the following addition, which
+// would skip the product's rounding.
+fn rounded(x: f32) -> f32 {
+    return bitcast<f32>(bitcast<u32>(x) ^ params.zero);
+}
+
+// The f32 column pass; returns the code values of one column.
+fn column_pass(r: array<f32, 8>) -> array<u32, 8> {
+    let p = r[0] + BIAS;
+    let ea = p + r[4];
+    let eb = p - r[4];
+    let f = rounded(r[6] * TAN2) + r[2];
+    let g = rounded(r[2] * TAN2) - r[6];
+    let e0 = ea + f;
+    let e3 = ea - f;
+    let e1 = eb + g;
+    let e2 = eb - g;
+    let a = rounded(r[7] * TAN1) + r[1];
+    let b = rounded(r[1] * TAN1) - r[7];
+    let c = rounded(r[5] * TAN3) + r[3];
+    let d = r[5] - rounded(r[3] * TAN3);
+    let o0 = a + c;
+    let t = a - c;
+    let o3 = b + d;
+    let u = b - d;
+    let o1 = rounded((t + u) * COS4);
+    let o2 = rounded((t - u) * COS4);
+    let y = array<f32, 8>(e0 + o0, e1 + o1, e2 + o2, e3 + o3, e3 - o3, e2 - o2, e1 - o1, e0 - o0);
+    var out: array<u32, 8>;
+    for (var i = 0u; i < 8u; i++) {
+        // Truncation toward zero, then saturation to 0..65535.
+        out[i] = u32(clamp(i32(y[i]), 0, 65535));
+    }
+    return out;
 }
 
 // Workgroup (x, y) is the square at those coordinates. Invocation t
 // transforms row and then column t % 8 of stream t / 8, then writes four
-// words of the square's output.
+// words of the square's output, unless the square's tile was skipped.
 @compute @workgroup_size(32)
 fn transform(
     @builtin(workgroup_id) group: vec3<u32>,
@@ -297,23 +399,26 @@ fn transform(
         x[2u * j] = bitcast<i32>(w << 16u) >> 16u;
         x[2u * j + 1u] = bitcast<i32>(w) >> 16u;
     }
-    let row = idct8(x, 1 << 12u, 13u);
+    let row = row_pass(x, k);
     for (var j = 0u; j < 8u; j++) {
-        blocks[block + k * 8u + j] = row[j];
+        blocks[block + k * 8u + j] = bitcast<u32>(to_f32(row[j]) * SCALE);
     }
     workgroupBarrier();
 
+    var col: array<f32, 8>;
     for (var i = 0u; i < 8u; i++) {
-        x[i] = blocks[block + i * 8u + k];
+        col[i] = bitcast<f32>(blocks[block + i * 8u + k]);
     }
-    // The column rounding term (1 << 14) / W4 = 1 is folded into x0.
-    x[0] += 1;
-    let col = idct8(x, 0, 15u);
+    let values = column_pass(col);
     for (var i = 0u; i < 8u; i++) {
-        blocks[block + i * 8u + k] = col[i];
+        blocks[block + i * 8u + k] = values[i];
     }
     workgroupBarrier();
 
+    // Nothing is written for a skipped tile.
+    if ((skipped[square >> 5u] >> (square & 31u)) & 1u) != 0u {
+        return;
+    }
     // Sensel (r, c) of the square is element (r / 2, c / 2) of the block
     // of the stream on phase (r % 2, c % 2). Word w of a row holds columns
     // 2w and 2w + 1.
@@ -323,6 +428,6 @@ fn transform(
     let out_row = (group.y * 16u + r) * params.squares_x * 8u + group.x * 8u;
     for (var j = 0u; j < 4u; j++) {
         let w = (t & 1u) * 4u + j;
-        samples[out_row + w] = code_value(blocks[even + w]) | (code_value(blocks[odd + w]) << 16u);
+        samples[out_row + w] = blocks[even + w] | (blocks[odd + w] << 16u);
     }
 }

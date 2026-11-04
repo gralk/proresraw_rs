@@ -4,7 +4,7 @@
 use crate::coefficients::{MAX_BLOCKS, decode_component};
 use crate::error::{Error, Result};
 use crate::header::{FrameHeader, MIN_HEADER_SIZE};
-use crate::idct::{code_value, inverse_transform};
+use crate::idct::Idct;
 use crate::tile::{TILE_UNIT, Tile, TileGeometry, TileGrid};
 
 /// Byte length of the frame prefix: size, tag and header size.
@@ -28,8 +28,10 @@ pub fn parse_frame(packet: &[u8]) -> Result<ParsedFrame<'_>> {
         needed: PREFIX_LEN,
         available: packet.len(),
     })?;
+    // Like Apple's decoder, accept any non-zero size up to the packet
+    // length; the frame is read from the packet regardless.
     let declared = u32::from_be_bytes([prefix[0], prefix[1], prefix[2], prefix[3]]);
-    if declared as usize != packet.len() {
+    if declared == 0 || declared as usize > packet.len() {
         return Err(Error::FrameSizeMismatch {
             declared,
             actual: packet.len(),
@@ -91,6 +93,10 @@ pub struct Frame {
     /// Sensels in row-major order over the coded size, including the
     /// padding rows and columns of the last tiles.
     pub samples: Vec<u16>,
+    /// Indices (frame order) of tiles skipped for an invalid tile header.
+    /// Such tiles are skipped without writing their sensels, as Apple's
+    /// decoder does; here they stay 0. Empty for a well-formed frame.
+    pub skipped_tiles: Vec<usize>,
 }
 
 impl Frame {
@@ -131,8 +137,14 @@ impl Frame {
     }
 }
 
-/// Decode one frame packet (one QuickTime sample).
+/// Decode one frame packet (one QuickTime sample) with the Apple-compatible
+/// inverse transform ([`Idct::Apple`]).
 pub fn decode_frame(packet: &[u8]) -> Result<Frame> {
+    decode_frame_with(packet, Idct::default())
+}
+
+/// Decode one frame packet with the given inverse transform.
+pub fn decode_frame_with(packet: &[u8], idct: Idct) -> Result<Frame> {
     let parsed = parse_frame(packet)?;
     let header = parsed.header;
     let stride = header.coded_width();
@@ -142,61 +154,72 @@ pub fn decode_frame(packet: &[u8]) -> Result<Frame> {
     let payload_rows = parsed.tiles.chunks_exact(per_row);
     let qmat = &header.quant_matrix;
     let phases = header.bayer_pattern.stream_phases();
+    let base = packet.as_ptr() as usize;
+    // Decode one tile row; returns the indices of the tiles it skipped.
     let decode_row = |(tile_row, (rows, payloads)): (usize, (&mut [u16], &[&[u8]]))| {
-        let geometry = parsed.grid.row(tile_row);
         let first_index = tile_row * per_row;
-        geometry
-            .zip(payloads)
-            .enumerate()
-            .try_for_each(|(i, (geometry, payload))| {
-                let tile = Tile::parse(payload, first_index + i)?;
-                decode_tile(&tile, geometry, qmat, phases, rows, stride);
-                Ok(())
-            })
+        let mut skipped = Vec::new();
+        for (i, (geometry, payload)) in parsed.grid.row(tile_row).zip(payloads).enumerate() {
+            match Tile::parse(payload, first_index + i) {
+                Ok(tile) => decode_tile(&tile, geometry, qmat, phases, idct, base, rows, stride),
+                Err(_) => skipped.push(first_index + i),
+            }
+        }
+        skipped
     };
     #[cfg(feature = "parallel")]
-    {
+    let skipped: Vec<Vec<usize>> = {
         use rayon::prelude::*;
         let rows: Vec<_> = tile_rows.zip(payload_rows).collect();
-        rows.into_par_iter().enumerate().try_for_each(decode_row)?;
-    }
+        rows.into_par_iter().enumerate().map(decode_row).collect()
+    };
     #[cfg(not(feature = "parallel"))]
-    tile_rows
+    let skipped: Vec<Vec<usize>> = tile_rows
         .zip(payload_rows)
         .enumerate()
-        .try_for_each(decode_row)?;
-    Ok(Frame { header, samples })
+        .map(decode_row)
+        .collect();
+    Ok(Frame {
+        header,
+        samples,
+        skipped_tiles: skipped.concat(),
+    })
 }
 
 /// Decode one tile into `rows`, the 16 sensel rows of its tile row,
 /// placing each stream on its Bayer phase.
+#[allow(clippy::too_many_arguments)]
 fn decode_tile(
     tile: &Tile<'_>,
     geometry: TileGeometry,
     qmat: &[u8; 64],
     phases: [(usize, usize); 4],
+    idct: Idct,
+    base: usize,
     rows: &mut [u16],
     stride: usize,
 ) {
-    let mut scaled = [0i32; 64];
-    for (s, &q) in scaled.iter_mut().zip(qmat) {
-        *s = i32::from(q) * i32::from(tile.qscale);
-    }
+    // qmat <= 63 and qscale <= 255 are validated, so the product fits i16.
+    let scaled: [i16; 64] =
+        std::array::from_fn(|i| (u16::from(qmat[i]) * u16::from(tile.qscale)) as i16);
     let blocks = geometry.blocks();
-    let mut coefs = [0i32; 64 * MAX_BLOCKS];
+    let mut coefs = [0i16; 64 * MAX_BLOCKS];
     let coefs = &mut coefs[..64 * blocks];
     for (stream, (phase_row, phase_col)) in tile.streams.iter().zip(phases) {
-        decode_component(stream, geometry.log2_blocks, coefs);
-        for (b, block) in coefs.chunks_exact_mut(64).enumerate() {
-            let block: &mut [i32; 64] = block.try_into().expect("64 coefficients");
-            inverse_transform(block, &scaled);
+        // The bit reader depends on the stream's offset modulo 4 (for
+        // invalid codewords only); the packet counts as 4-byte aligned.
+        let align = (stream.as_ptr() as usize).wrapping_sub(base) & 3;
+        decode_component(stream, align, geometry.log2_blocks, coefs);
+        for (b, block) in coefs.chunks_exact(64).enumerate() {
+            let block: &[i16; 64] = block.try_into().expect("64 coefficients");
+            let values = idct.transform(block, &scaled);
             let x0 = geometry.x + b * TILE_UNIT + phase_col;
-            for (i, line) in block.chunks_exact(8).enumerate() {
+            for (i, line) in values.chunks_exact(8).enumerate() {
                 let start = (2 * i + phase_row) * stride + x0;
                 // Eight samples two apart span fifteen sensels.
                 let dst = &mut rows[start..start + 15];
                 for (d, &v) in dst.iter_mut().step_by(2).zip(line) {
-                    *d = code_value(v);
+                    *d = v;
                 }
             }
         }
@@ -239,8 +262,9 @@ mod tests {
         p.extend_from_slice(b"prrf");
         p.extend_from_slice(&72u16.to_be_bytes());
         p.extend_from_slice(&body);
-        p.extend_from_slice(&8u16.to_be_bytes());
-        p.extend_from_slice(&[8 << 3, 1, 0, 0, 0, 0, 0, 0]);
+        // Four one-byte streams of zero bits.
+        p.extend_from_slice(&12u16.to_be_bytes());
+        p.extend_from_slice(&[8 << 3, 1, 0, 1, 0, 1, 0, 1, 0, 0, 0, 0]);
         let len = p.len() as u32;
         p[..4].copy_from_slice(&len.to_be_bytes());
         let frame = decode_frame(&p).unwrap();
@@ -248,8 +272,37 @@ mod tests {
             (frame.width(), frame.height(), frame.stride()),
             (16, 16, 16)
         );
+        assert!(frame.skipped_tiles.is_empty());
         assert!(frame.samples.iter().all(|&v| v == 32768));
         assert!(frame.linearize().iter().all(|&v| v == 4096));
+
+        // Empty streams make the tile invalid: it is skipped.
+        let at = p.len() - 12;
+        p[at - 2..at].copy_from_slice(&8u16.to_be_bytes());
+        p.truncate(at + 8);
+        p[at + 2..at + 8].fill(0);
+        let len = p.len() as u32;
+        p[..4].copy_from_slice(&len.to_be_bytes());
+        let frame = decode_frame(&p).unwrap();
+        assert_eq!(frame.skipped_tiles, [0]);
+        assert!(frame.samples.iter().all(|&v| v == 0));
+    }
+
+    #[test]
+    fn frame_size_may_be_below_the_packet_length() {
+        let mut p = vec![0u8; 80];
+        p[4..8].copy_from_slice(b"prrf");
+        p[8..10].copy_from_slice(&61u16.to_be_bytes());
+        for size in [0u32, 81] {
+            p[..4].copy_from_slice(&size.to_be_bytes());
+            assert!(matches!(
+                decode_frame(&p),
+                Err(Error::FrameSizeMismatch { .. })
+            ));
+        }
+        // A size below the packet length passes the size check.
+        p[..4].copy_from_slice(&20u32.to_be_bytes());
+        assert_eq!(decode_frame(&p), Err(Error::HeaderTooShort(61)));
     }
 
     #[test]

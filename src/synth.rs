@@ -88,7 +88,9 @@ pub fn random_frame(spec: &Spec, rng: &mut Rng) -> Vec<u8> {
 }
 
 /// One tile: an 8-byte header and four streams of random bits whose
-/// lengths range from empty to generous for the block count.
+/// lengths range from empty to generous for the block count. A zero
+/// qscale or an empty stream makes the tile invalid, so a few tiles of
+/// every frame are skipped.
 fn random_tile(blocks: usize, rng: &mut Rng) -> Vec<u8> {
     let qscale = rng.below(256) as u8;
     let sizes: [usize; 4] = std::array::from_fn(|_| rng.below(48 * blocks as u32 + 1) as usize);
@@ -117,12 +119,18 @@ pub fn specs(rng: &mut Rng) -> Vec<Spec> {
         for (i, &pattern) in patterns.iter().enumerate() {
             let width = 2 * (1 + rng.below(300) as u16);
             let height = 2 * (1 + rng.below(40) as u16);
+            // Quantization matrices and curves within what Apple's decoder
+            // accepts: entries 1..=63, curves rising strictly.
             let quant_matrix = match i {
                 0 => None,
-                1 => Some([255; 64]),
-                _ => Some(std::array::from_fn(|_| rng.below(256) as u8)),
+                1 => Some([63; 64]),
+                _ => Some(std::array::from_fn(|_| 1 + rng.below(63) as u8)),
             };
-            let curve = (i % 2 == 1).then(|| std::array::from_fn(|_| rng.below(65536) as u16));
+            let curve = (i % 2 == 1).then(|| {
+                let mut c: [u16; 8] = std::array::from_fn(|_| rng.below(65536 - 8) as u16);
+                c.sort_unstable();
+                std::array::from_fn(|k| c[k] + k as u16)
+            });
             out.push(Spec {
                 width,
                 height,

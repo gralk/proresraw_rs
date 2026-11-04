@@ -109,7 +109,7 @@ impl TileGrid {
 /// The parsed header of one tile and its four component streams.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Tile<'a> {
-    /// Quantizer scale multiplying the frame's quantization matrix.
+    /// Quantizer scale multiplying the frame's quantization matrix, 1..=255.
     pub qscale: u8,
     /// Entropy-coded coefficient streams in stored order: green, green,
     /// blue, red (see [`crate::header::BayerPattern::stream_phases`] for
@@ -119,6 +119,10 @@ pub struct Tile<'a> {
 
 impl<'a> Tile<'a> {
     /// Split a tile payload into its header and component streams.
+    ///
+    /// Valid, as Apple's decoder requires: a header of at least the eight
+    /// fixed bytes, a qscale of 1..=255, and four non-empty streams that fit
+    /// the tile.
     pub fn parse(data: &'a [u8], index: usize) -> Result<Self> {
         let bad = || Error::BadTileHeader { tile: index };
         if data.len() < TILE_HEADER_FIXED {
@@ -131,11 +135,14 @@ impl<'a> Tile<'a> {
             usize::from(u16::from_be_bytes([data[4], data[5]])),
             usize::from(u16::from_be_bytes([data[6], data[7]])),
         ];
-        let body = data.get(header_len..).ok_or_else(bad)?;
-        let first_three = sizes[0] + sizes[1] + sizes[2];
-        if first_three > body.len() {
+        if header_len < TILE_HEADER_FIXED || qscale == 0 || sizes.contains(&0) {
             return Err(bad());
         }
+        let used = header_len + sizes[0] + sizes[1] + sizes[2];
+        if used >= data.len() {
+            return Err(bad());
+        }
+        let body = &data[header_len..];
         let (s0, rest) = body.split_at(sizes[0]);
         let (s1, rest) = rest.split_at(sizes[1]);
         let (s2, s3) = rest.split_at(sizes[2]);
@@ -217,5 +224,28 @@ mod tests {
         );
         let data = [16 << 3, 1, 0, 0, 0, 0, 0, 0, 1, 2];
         assert_eq!(Tile::parse(&data, 1), Err(Error::BadTileHeader { tile: 1 }));
+    }
+
+    #[test]
+    fn tile_header_rejects_what_apple_rejects() {
+        let tile = |hdr: u8, qscale: u8, sizes: [u16; 3], len: usize| {
+            let mut d = vec![hdr << 3, qscale];
+            sizes
+                .iter()
+                .for_each(|s| d.extend_from_slice(&s.to_be_bytes()));
+            d.resize(len, 0xAA);
+            Tile::parse(&d, 0).is_ok()
+        };
+        assert!(tile(8, 1, [1, 1, 1], 12));
+        // Header shorter than its fixed fields.
+        assert!(!tile(7, 1, [1, 1, 1], 12));
+        // qscale 0.
+        assert!(!tile(8, 0, [1, 1, 1], 12));
+        // Empty first, second or third stream.
+        assert!(!tile(8, 1, [0, 1, 1], 12));
+        assert!(!tile(8, 1, [1, 0, 1], 12));
+        assert!(!tile(8, 1, [1, 1, 0], 12));
+        // Empty fourth stream.
+        assert!(!tile(8, 1, [1, 1, 1], 11));
     }
 }

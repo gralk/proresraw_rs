@@ -3,8 +3,14 @@
 //! The caller owns the device: build a [`GpuDecoder`] from it once, then
 //! decode packets into storage buffers that stay on the GPU. The host
 //! parses and validates the frame and tile headers; the GPU decodes the
-//! component streams and inverse-transforms the blocks, bit-exactly with
-//! [`crate::decode_frame`].
+//! component streams, bit-exactly with [`crate::decode_frame`], and
+//! inverse-transforms the blocks with the Apple-compatible transform. Its
+//! column pass is in `f32`; a driver may fuse a multiply and an add there,
+//! so a few code values can differ from the host by one.
+//!
+//! Tiles with an invalid header are skipped as on the host: their sensels
+//! are not written, so a fresh output buffer holds 0 there and a buffer
+//! passed to [`GpuDecoder::decode_into`] keeps its contents.
 //!
 //! The output buffer holds the code values of the coded picture
 //! ([`FrameHeader::coded_width`] × [`FrameHeader::coded_height`] sensels,
@@ -21,6 +27,7 @@ use crate::codebook::{
 use crate::decoder::{Frame, ParsedFrame, parse_frame};
 use crate::error::Error;
 use crate::header::FrameHeader;
+use crate::idct::{BIAS, COS4, ROW_SET, ROW_TABLES, SCALE, TAN1, TAN2, TAN3};
 use crate::tile::{TILE_UNIT, Tile};
 
 /// Invocations per workgroup of the stream pass.
@@ -120,6 +127,28 @@ fn tables() -> String {
         "const SCAN = array<u32, 64>({});\n",
         list(SCAN.iter().map(|&s| u32::from(s)))
     );
+    out += &format!(
+        "const ROW_SET = array<u32, 8>({});\n",
+        list(ROW_SET.iter().map(|&s| s as u32))
+    );
+    let rows: Vec<String> = ROW_TABLES
+        .iter()
+        .flatten()
+        .flatten()
+        .map(|v| format!("{v}"))
+        .collect();
+    out += &format!("const ROW_TABLES = array<i32, 128>({});\n", rows.join(", "));
+    for (name, v) in [
+        ("SCALE", SCALE),
+        ("BIAS", BIAS),
+        ("TAN1", TAN1),
+        ("TAN2", TAN2),
+        ("TAN3", TAN3),
+        ("COS4", COS4),
+    ] {
+        // Shortest round-trip decimal: parses back to the same f32.
+        out += &format!("const {name} = {v:?}f;\n");
+    }
     out
 }
 
@@ -167,6 +196,8 @@ pub struct GpuDecoder {
     packet: Slot,
     streams: Slot,
     coefs: Slot,
+    skipped: Slot,
+    skipped_tiles: Vec<usize>,
 }
 
 impl GpuDecoder {
@@ -190,6 +221,7 @@ impl GpuDecoder {
                 storage(2, true),
                 storage(3, false),
                 storage(4, false),
+                storage(5, true),
             ],
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -226,6 +258,8 @@ impl GpuDecoder {
                     | wgpu::BufferUsages::COPY_SRC
                     | wgpu::BufferUsages::COPY_DST,
             ),
+            skipped: Slot::new("prores raw skipped squares", copy_storage),
+            skipped_tiles: Vec::new(),
         }
     }
 
@@ -245,7 +279,17 @@ impl GpuDecoder {
             mapped_at_creation: false,
         });
         let header = self.submit(device, queue, packet, parsed, &samples)?;
-        Ok(GpuFrame { header, samples })
+        Ok(GpuFrame {
+            header,
+            samples,
+            skipped_tiles: self.skipped_tiles.clone(),
+        })
+    }
+
+    /// Indices of the tiles of the most recently submitted frame that were
+    /// skipped for an invalid tile header (see [`Frame::skipped_tiles`]).
+    pub fn skipped_tiles(&self) -> &[usize] {
+        &self.skipped_tiles
     }
 
     /// Decode `packet` into `samples`, a buffer with `STORAGE` usage of at
@@ -307,7 +351,8 @@ impl GpuDecoder {
     ) -> Result<(wgpu::CommandEncoder, wgpu::BindGroup, Layout), GpuError> {
         let limits = device.limits();
         let layout = Layout::new(&parsed.header);
-        let table = stream_table(packet, parsed, &layout)?;
+        let (table, skipped_squares) =
+            stream_table(packet, parsed, &layout, &mut self.skipped_tiles);
         let check = |what, bytes: u64| {
             let limit =
                 u64::from(limits.max_storage_buffer_binding_size).min(limits.max_buffer_size);
@@ -342,6 +387,8 @@ impl GpuDecoder {
         let packet_buf = self.packet.get(device, packet_bytes);
         upload_padded(queue, packet_buf, packet);
         let coefs_buf = self.coefs.get(device, layout.coef_bytes());
+        let skipped_buf = self.skipped.get(device, (skipped_squares.len() * 4) as u64);
+        queue.write_buffer(skipped_buf, 0, &words_to_bytes(&skipped_squares));
 
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("prores raw frame"),
@@ -352,6 +399,7 @@ impl GpuDecoder {
                 entry(2, streams_buf),
                 entry(3, coefs_buf),
                 entry(4, samples),
+                entry(5, skipped_buf),
             ],
         });
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -442,6 +490,8 @@ pub struct GpuFrame {
     pub header: FrameHeader,
     /// Code values of the coded picture, two per word (see the module docs).
     pub samples: wgpu::Buffer,
+    /// Indices of tiles skipped for an invalid header; their sensels are 0.
+    pub skipped_tiles: Vec<usize>,
 }
 
 impl GpuFrame {
@@ -454,6 +504,7 @@ impl GpuFrame {
                 .chunks_exact(2)
                 .map(|h| u16::from_le_bytes([h[0], h[1]]))
                 .collect(),
+            skipped_tiles: self.skipped_tiles.clone(),
         })
     }
 }
@@ -470,25 +521,37 @@ fn params(header: &FrameHeader, layout: &Layout, streams: u32) -> Vec<u32> {
     for (stream, (row, col)) in header.bayer_pattern.stream_phases().into_iter().enumerate() {
         phase_stream[row * 2 + col] = stream as u32;
     }
+    // The fourth word must be 0: the shader XORs it into products (`rounded`).
     let mut out = vec![layout.squares_x, layout.squares_y, streams, 0];
     out.extend(phase_stream);
     out.extend(header.quant_matrix.iter().map(|&q| u32::from(q)));
     out
 }
 
-/// One entry per component stream of every tile: byte offset, byte
-/// length, first square and packed block count, qscale and stream index.
+/// One entry per component stream of every valid tile: byte offset, byte
+/// length, first square and packed block count, qscale and stream index;
+/// and a bitmap of the squares of skipped tiles, whose indices go to
+/// `skipped_tiles`.
 fn stream_table(
     packet: &[u8],
     parsed: &ParsedFrame<'_>,
     layout: &Layout,
-) -> Result<Vec<u32>, GpuError> {
+    skipped_tiles: &mut Vec<usize>,
+) -> (Vec<u32>, Vec<u32>) {
     let base = packet.as_ptr() as usize;
     let mut table = Vec::with_capacity(parsed.tiles.len() * 4 * STREAM_WORDS);
+    let mut skipped = vec![0u32; (layout.squares() as usize).div_ceil(32).max(1)];
+    skipped_tiles.clear();
     for (index, (geometry, payload)) in parsed.grid.tiles().zip(&parsed.tiles).enumerate() {
-        let tile = Tile::parse(payload, index)?;
         let square =
             (geometry.y / TILE_UNIT) as u32 * layout.squares_x + (geometry.x / TILE_UNIT) as u32;
+        let Ok(tile) = Tile::parse(payload, index) else {
+            skipped_tiles.push(index);
+            for sq in square..square + geometry.blocks() as u32 {
+                skipped[(sq / 32) as usize] |= 1 << (sq % 32);
+            }
+            continue;
+        };
         for (stream, data) in tile.streams.iter().enumerate() {
             // Streams are subslices of the packet; their address gives the offset.
             let offset = data.as_ptr() as usize - base;
@@ -503,7 +566,7 @@ fn stream_table(
             ]);
         }
     }
-    Ok(table)
+    (table, skipped)
 }
 
 fn entry(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
@@ -599,20 +662,28 @@ mod tests {
         let parsed = parse_frame(packet).unwrap();
         let layout = Layout::new(&parsed.header);
         let mut words = vec![0u32; (layout.coef_bytes() / 4) as usize];
-        let mut coefs = vec![0i32; 64 * 16];
+        let base = packet.as_ptr() as usize;
+        let mut coefs = vec![0i16; 64 * 16];
         for (index, (geometry, payload)) in parsed.grid.tiles().zip(&parsed.tiles).enumerate() {
-            let tile = Tile::parse(payload, index).unwrap();
+            let Ok(tile) = Tile::parse(payload, index) else {
+                continue;
+            };
             let blocks = geometry.blocks();
             let square =
                 (geometry.y / TILE_UNIT) * layout.squares_x as usize + geometry.x / TILE_UNIT;
             for (stream, data) in tile.streams.iter().enumerate() {
                 let c = &mut coefs[..64 * blocks];
-                decode_component(data, geometry.log2_blocks, c);
+                decode_component(
+                    data,
+                    (data.as_ptr() as usize - base) & 3,
+                    geometry.log2_blocks,
+                    c,
+                );
                 for (b, block) in c.chunks_exact(64).enumerate() {
                     for (raster, &v) in block.iter().enumerate() {
                         let q =
-                            i32::from(parsed.header.quant_matrix[raster]) * i32::from(tile.qscale);
-                        let d = dequantize(v, q) as u32 & 0xFFFF;
+                            i16::from(parsed.header.quant_matrix[raster]) * i16::from(tile.qscale);
+                        let d = dequantize(v, q) as u16 as u32;
                         let word = (square + b) * 128 + stream * 32 + raster / 2;
                         words[word] |= d << (16 * (raster % 2));
                     }
@@ -649,6 +720,7 @@ mod tests {
         };
         let mut decoder = GpuDecoder::new(&device);
         let mut rng = Rng::new(11);
+        let (mut total, mut differ, mut worst) = (0usize, 0usize, 0i32);
         for spec in specs(&mut rng) {
             let packet = random_frame(&spec, &mut rng);
             let gpu = decoder
@@ -657,15 +729,18 @@ mod tests {
                 .download(&device, &queue)
                 .unwrap();
             let host = crate::decode_frame(&packet).unwrap();
-            assert!(
-                gpu == host,
-                "alignment {} pattern {:?} {}x{}",
-                spec.alignment,
-                spec.pattern,
-                spec.width,
-                spec.height
-            );
+            assert_eq!(gpu.header, host.header);
+            assert_eq!(gpu.skipped_tiles, host.skipped_tiles);
+            total += host.samples.len();
+            for (&g, &h) in gpu.samples.iter().zip(&host.samples) {
+                if g != h {
+                    differ += 1;
+                    worst = worst.max((i32::from(g) - i32::from(h)).abs());
+                }
+            }
         }
+        eprintln!("GPU vs host: {differ} of {total} samples differ, max |diff| {worst}");
+        assert_eq!(differ, 0);
     }
 
     #[test]

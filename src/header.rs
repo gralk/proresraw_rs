@@ -111,7 +111,7 @@ pub struct Crop {
 /// Everything the frame header says about the picture.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FrameHeader {
-    /// Bitstream version; 0 and 1 are known.
+    /// Bitstream version, 0 or 1. Only version 1 may carry a curve.
     pub version: u8,
     /// Four-character vendor tag, such as `atm0` or `apl0`.
     pub vendor: [u8; 4],
@@ -139,7 +139,7 @@ pub struct FrameHeader {
     pub flags: u16,
     /// Tile alignment: the widest tile spans `16 << alignment` sensels.
     pub alignment: u8,
-    /// Quantization matrix in raster order, all ones when absent.
+    /// Quantization matrix in raster order, entries 1..=63; all ones when absent.
     pub quant_matrix: [u8; 64],
     /// Linearization curve, the default when absent.
     pub curve: Curve,
@@ -192,12 +192,28 @@ impl FrameHeader {
         let mut quant_matrix = [1u8; 64];
         if flags & 1 != 0 {
             quant_matrix = r.array::<64>("quantization matrix")?;
+            // Apple's decoder takes entries 1..=63 only, which keeps the
+            // dequantizer qmat × qscale within 16 bits.
+            if let Some(index) = quant_matrix.iter().position(|&q| !(1..=63).contains(&q)) {
+                return Err(Error::BadQuantMatrix {
+                    index,
+                    value: quant_matrix[index],
+                });
+            }
         }
         let curve = if (flags >> 4) & 1 != 0 {
             let raw = r.array::<16>("linearization curve")?;
             let mut points = [0u16; 8];
             for (p, pair) in points.iter_mut().zip(raw.chunks_exact(2)) {
                 *p = u16::from_be_bytes([pair[0], pair[1]]);
+            }
+            // Version 0 streams carry no curve, and a curve must rise
+            // strictly (both required by Apple's decoder).
+            if version == 0 {
+                return Err(Error::UnexpectedCurve);
+            }
+            if points.windows(2).any(|w| w[0] >= w[1]) {
+                return Err(Error::BadCurve(points));
             }
             Curve(points)
         } else {
@@ -340,7 +356,9 @@ mod tests {
         for p in [0u16, 224, 288, 468, 1162, 3339, 9431, 25377] {
             tail.extend_from_slice(&p.to_be_bytes());
         }
-        let h = FrameHeader::parse(&body(0b11_1001, &tail)).unwrap();
+        let mut b = body(0b11_1001, &tail);
+        b[1] = 1; // only version 1 may carry a curve
+        let h = FrameHeader::parse(&b).unwrap();
         assert_eq!(h.alignment, 4);
         assert_eq!(h.quant_matrix, [7; 64]);
         assert_eq!(h.curve.0, [0, 224, 288, 468, 1162, 3339, 9431, 25377]);
@@ -369,6 +387,38 @@ mod tests {
             FrameHeader::parse(&body(1, &[0; 10])),
             Err(Error::Truncated { .. })
         ));
+    }
+
+    /// Checks Apple's decoder makes that the format description does not.
+    #[test]
+    fn rejects_what_apple_rejects() {
+        let mut qmat = vec![63u8; 64];
+        qmat[5] = 64;
+        assert_eq!(
+            FrameHeader::parse(&body(1, &qmat)),
+            Err(Error::BadQuantMatrix {
+                index: 5,
+                value: 64
+            })
+        );
+        qmat[5] = 0;
+        assert_eq!(
+            FrameHeader::parse(&body(1, &qmat)),
+            Err(Error::BadQuantMatrix { index: 5, value: 0 })
+        );
+        let curve = |points: [u16; 8], version: u8| {
+            let tail: Vec<u8> = points.iter().flat_map(|p| p.to_be_bytes()).collect();
+            let mut b = body(0x10, &tail);
+            b[1] = version;
+            FrameHeader::parse(&b)
+        };
+        let rising = [0, 512, 1024, 2048, 4096, 8192, 16384, 32768];
+        assert!(curve(rising, 1).is_ok());
+        assert_eq!(curve(rising, 0), Err(Error::UnexpectedCurve));
+        let flat = [0, 512, 512, 2048, 4096, 8192, 16384, 32768];
+        assert_eq!(curve(flat, 1), Err(Error::BadCurve(flat)));
+        let falling = [0, 512, 1024, 2048, 4096, 8192, 16384, 100];
+        assert_eq!(curve(falling, 1), Err(Error::BadCurve(falling)));
     }
 
     #[test]

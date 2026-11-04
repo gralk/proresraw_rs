@@ -11,7 +11,7 @@
 
 use std::path::{Path, PathBuf};
 
-use proresraw_rs::decode_frame;
+use proresraw_rs::{Idct, decode_frame_with};
 
 fn fixture_dir() -> Option<PathBuf> {
     std::env::var_os("PRORES_RAW_FIXTURES").map(PathBuf::from)
@@ -42,7 +42,8 @@ fn matches_ffmpeg_linearized_output() {
         };
         compared += 1;
         let packet = std::fs::read(&packet_path).unwrap();
-        let frame = decode_frame(&packet).unwrap();
+        // FFmpeg uses the simple IDCT; the default (Apple-compatible) transform differs.
+        let frame = decode_frame_with(&packet, Idct::Ffmpeg).unwrap();
         let linear = frame.linearize();
         assert_eq!(
             reference.len(),
@@ -81,7 +82,7 @@ fn gpu_matches_the_host_on_every_fixture() {
     let mut decoder = proresraw_rs::GpuDecoder::new(&device);
     for packet_path in packets(&dir) {
         let packet = std::fs::read(&packet_path).unwrap();
-        let host = decode_frame(&packet).unwrap();
+        let host = proresraw_rs::decode_frame(&packet).unwrap();
         let gpu = decoder
             .decode(&device, &queue, &packet)
             .unwrap()

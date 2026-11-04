@@ -31,18 +31,22 @@ Demuxing is out of scope: any QuickTime reader that yields samples works.
   matrices and linearization curves are handled.
 - RGGB and BGGR frames verified; GRBG and GBRG follow the same rule but
   no sample has been seen.
-- Bit-exact with FFmpeg master's C `prores_raw` decoder on seven Atomos
-  clips (`aprn` and `aprh`, partial edge tiles, qscale 15 and 45), and
-  matches an Apple-decoded DNG conversion of one of them to within the
-  DNG's 12-bit quantization.
+- Apple-compatible by default: the inverse transform, the validity rules
+  and the decoding of malformed streams follow Apple's decoder, bit for
+  bit. Invalid tiles are skipped as Apple's decoder skips them and are
+  listed in `Frame::skipped_tiles`.
+- With `decode_frame_with(packet, Idct::Ffmpeg)`, bit-exact with FFmpeg
+  master's C `prores_raw` decoder on seven Atomos clips (`aprn` and
+  `aprh`, partial edge tiles, qscale 15 and 45). The two transforms
+  differ by ±1–3 code values on about a third of the samples.
 - Tile rows decode in parallel on rayon (feature `parallel`, on by
   default). A 5.8K frame decodes in about 45 ms on a desktop CPU.
 
 ## GPU decoding
 
 With the `gpu` feature, `GpuDecoder` decodes on a wgpu device the
-application provides, bit-exactly with the host decoder. The output stays
-on the GPU in a storage buffer, ready for the next compute stage:
+application provides, with the Apple-compatible transform. The output
+stays on the GPU in a storage buffer, ready for the next compute stage:
 
 ```rust
 let mut decoder = proresraw_rs::GpuDecoder::new(&device);
@@ -63,8 +67,12 @@ The crate enables no wgpu backend itself; the application chooses them.
 
 The host parses and validates the frame and tile headers and uploads the
 packet with a table of component streams. One compute pass decodes each
-stream on its own invocation and stores dequantized coefficients; a
-second runs the integer inverse transform per 16×16 sensel square.
+stream on its own invocation and stores dequantized coefficients,
+bit-exactly with the host; a second runs the inverse transform per 16×16
+sensel square. The transform's column pass is in `f32`, and WGSL does
+not promise correctly rounded arithmetic, so a device may differ from the
+host by one code value on rare samples; on an RTX 3060 (Vulkan) the
+output is bit-exact with the host on every test frame.
 
 Steady-state time per frame on an RTX 3060 (upload included) against the
 parallel host decoder on the same machine:
@@ -82,14 +90,16 @@ Entropy decoding is serial within a stream and dominates the GPU time.
 
 `docs/bitstream.md` is the format description the code is written from.
 The modules follow it: `header` (§3), `tile` (§4–5), `bits` and
-`codebook` (§6.1), `coefficients` (§6.2–6.4), `idct` (§7), `curve`
+`codebook` (§6.0–6.1), `coefficients` (§6.2–6.4), `idct` (§7), `curve`
 (§8) and `decoder` (§2, placement). `gpu` and `gpu/decode.wgsl` mirror
-§6–7 on the GPU; the shader's tables are generated from `codebook`. No
-unsafe code.
+§6–7 on the GPU; the shader's tables are generated from `codebook` and
+`idct`. No unsafe code.
 
 Random frames from `synth` (every alignment and Bayer pattern, extreme
-quantizers) must decode identically on the host and the GPU.
-`tests/oracle.rs` compares against FFmpeg's `prores_raw` decoder when
+quantizers, invalid tiles) must decode identically on the host and the
+GPU. The Apple-compatible transform is checked against reference vectors
+in `tests/data/`. `tests/oracle.rs` compares the FFmpeg transform
+against FFmpeg's `prores_raw` decoder when
 `PRORES_RAW_FIXTURES` points at fixtures made by a tool outside the
 repository; it is skipped otherwise. The FFmpeg build must have x86
 assembly disabled: with AVX2 its Bayer path inherits a transposed IDCT
@@ -97,5 +107,5 @@ permutation and every block comes out transposed.
 
 ## License
 
-MIT. The format description was written from public reverse-engineering
-results and sample footage; see `docs/bitstream.md` for provenance.
+MIT. The format description was written from public sources and sample
+footage; see `docs/bitstream.md` for provenance.
