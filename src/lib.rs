@@ -15,7 +15,8 @@
 //! any other QuickTime reader that yields samples works as well.
 //!
 //! With the `gpu` feature, [`gpu::GpuDecoder`] decodes on a wgpu device
-//! the application provides and leaves the code values in a GPU buffer.
+//! the application provides and leaves the code values in a GPU buffer,
+//! and [`gpu::GpuDeveloper`] runs the raw conversion on them there.
 //!
 //! ```no_run
 //! let packet = std::fs::read("frame.bin").unwrap();
@@ -57,7 +58,7 @@ pub use demosaic::{
 };
 pub use error::{Error, Result};
 #[cfg(feature = "gpu")]
-pub use gpu::{GpuDecoder, GpuError, GpuFrame};
+pub use gpu::{GpuDecoder, GpuDeveloper, GpuError, GpuFrame, GpuRgb};
 pub use header::{BLACK_LEVEL, BayerPattern, Color, Crop, FrameHeader};
 pub use idct::Idct;
 pub use reduced::{Greens, RgbFrame, Scale, decode_frame_reduced, decode_frame_reduced_with};

@@ -17,8 +17,16 @@
 //! row-major) packed two per 32-bit word: the even column in the low 16
 //! bits, the odd column in the high 16 bits. Apply the header curve to
 //! reach linear values, as on the host.
+//!
+//! [`GpuDeveloper`] runs the raw conversion ([`crate::develop_planar`]) on
+//! such a buffer, or on an uploaded host frame, into three `f32` planes
+//! ([`GpuRgb`]) that stay on the GPU until downloaded.
 
 use std::fmt;
+
+mod develop;
+
+pub use develop::{GpuDeveloper, GpuRgb, plane_bytes};
 
 use crate::codebook::{
     AC_CB, AC_INITIAL, Codebook, DC_CB, DC_RESET, FIRST_DC, LN_CB, LN_INITIAL, RN_CB, RN_INITIAL,
