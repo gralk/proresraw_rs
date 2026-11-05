@@ -7,8 +7,10 @@ use crate::header::{FrameHeader, MIN_HEADER_SIZE};
 use crate::idct::Idct;
 use crate::tile::{TILE_UNIT, Tile, TileGeometry, TileGrid};
 
-/// Byte length of the frame prefix: size, tag and header size.
-const PREFIX_LEN: usize = 10;
+/// Byte length of the frame prefix that precedes the header body: the
+/// frame size (`u32`, big-endian), the tag `prrf` and the header size
+/// (`u16`, big-endian, counting itself and the body).
+pub const PREFIX_LEN: usize = 10;
 
 /// A frame split into its header and tile payloads, before any decoding.
 #[derive(Debug, Clone)]
@@ -32,6 +34,44 @@ pub(crate) fn quantizer(header: &FrameHeader, max_qscale: u8) -> u32 {
     u32::from(header.quant_matrix[0]) * u32::from(max_qscale)
 }
 
+/// Parse the frame header from the start of a packet, without the tile
+/// table or tiles.
+///
+/// Only the first [`header_len`] bytes are read, so a container reader
+/// can summarize a clip from the start of its first sample: read
+/// [`PREFIX_LEN`] bytes, then `header_len` of them. The frame size field
+/// is not checked against the packet, which may be truncated here;
+/// [`parse_frame`] checks it.
+pub fn parse_header(packet: &[u8]) -> Result<FrameHeader> {
+    let body_end = header_len(packet)?;
+    let body = packet.get(PREFIX_LEN..body_end).ok_or(Error::Truncated {
+        what: "frame header",
+        needed: body_end,
+        available: packet.len(),
+    })?;
+    FrameHeader::parse(body)
+}
+
+/// Bytes from the start of a packet to the end of its header: the
+/// [`PREFIX_LEN`]-byte prefix plus the header body. Reads and checks the
+/// prefix (tag and header size) only.
+pub fn header_len(packet: &[u8]) -> Result<usize> {
+    let prefix = packet.get(..PREFIX_LEN).ok_or(Error::Truncated {
+        what: "frame prefix",
+        needed: PREFIX_LEN,
+        available: packet.len(),
+    })?;
+    let tag = [prefix[4], prefix[5], prefix[6], prefix[7]];
+    if &tag != b"prrf" {
+        return Err(Error::BadTag(tag));
+    }
+    let header_size = u16::from_be_bytes([prefix[8], prefix[9]]);
+    if header_size < MIN_HEADER_SIZE {
+        return Err(Error::HeaderTooShort(header_size));
+    }
+    Ok(PREFIX_LEN + usize::from(header_size) - 2)
+}
+
 /// Split a packet into its header and tiles without decoding them.
 pub fn parse_frame(packet: &[u8]) -> Result<ParsedFrame<'_>> {
     let prefix = packet.get(..PREFIX_LEN).ok_or(Error::Truncated {
@@ -48,21 +88,8 @@ pub fn parse_frame(packet: &[u8]) -> Result<ParsedFrame<'_>> {
             actual: packet.len(),
         });
     }
-    let tag = [prefix[4], prefix[5], prefix[6], prefix[7]];
-    if &tag != b"prrf" {
-        return Err(Error::BadTag(tag));
-    }
-    let header_size = u16::from_be_bytes([prefix[8], prefix[9]]);
-    if header_size < MIN_HEADER_SIZE {
-        return Err(Error::HeaderTooShort(header_size));
-    }
-    let body_end = PREFIX_LEN + usize::from(header_size) - 2;
-    let body = packet.get(PREFIX_LEN..body_end).ok_or(Error::Truncated {
-        what: "frame header",
-        needed: body_end,
-        available: packet.len(),
-    })?;
-    let header = FrameHeader::parse(body)?;
+    let body_end = header_len(packet)?;
+    let header = parse_header(packet)?;
     let grid = TileGrid::new(
         usize::from(header.width),
         usize::from(header.height),
@@ -359,6 +386,27 @@ mod tests {
         // A size below the packet length passes the size check.
         p[..4].copy_from_slice(&20u32.to_be_bytes());
         assert_eq!(decode_frame(&p), Err(Error::HeaderTooShort(61)));
+    }
+
+    /// The header parses from the prefix and body alone, before the tile
+    /// table, and agrees with a full parse.
+    #[test]
+    fn header_parses_from_the_packet_start() {
+        let mut rng = crate::synth::Rng::new(13);
+        let spec = crate::synth::Spec::new(48, 32, crate::BayerPattern::Bggr);
+        let packet = crate::synth::random_frame(&spec, &mut rng);
+        let len = header_len(&packet).unwrap();
+        assert!(len < packet.len());
+        let header = parse_header(&packet[..len]).unwrap();
+        assert_eq!(header, parse_frame(&packet).unwrap().header);
+        assert!(matches!(
+            parse_header(&packet[..len - 1]),
+            Err(Error::Truncated { .. })
+        ));
+        assert!(matches!(
+            header_len(&packet[..PREFIX_LEN - 1]),
+            Err(Error::Truncated { .. })
+        ));
     }
 
     #[test]

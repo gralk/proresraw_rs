@@ -146,7 +146,13 @@ pub struct FrameHeader {
 }
 
 impl FrameHeader {
-    /// Parse the header body (the bytes after the `header_size` field).
+    /// Parse the header body: the bytes after the `header_size` field.
+    ///
+    /// A frame packet starts with a [`PREFIX_LEN`](crate::decoder::PREFIX_LEN)-byte
+    /// prefix: the frame size (`u32`, big-endian), the tag `prrf` and
+    /// `header_size` (`u16`, big-endian), which counts itself and the
+    /// body, so the body is `header_size - 2` bytes from offset 10.
+    /// [`crate::parse_header`] reads the prefix and calls this.
     pub fn parse(body: &[u8]) -> Result<Self> {
         if body.len() < FIXED_BODY_LEN {
             return Err(Error::Truncated {

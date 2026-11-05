@@ -20,6 +20,10 @@ let linear = frame.linearize();                      // width * height u16
 println!("{:?} white {}", frame.header.bayer_pattern, frame.header.white_level);
 ```
 
+For a clip summary, `parse_header` reads the header from the start of
+a sample alone: `header_len` gives the byte count from its first
+`PREFIX_LEN` (10) bytes.
+
 `mov::read_video_track` finds a clip's frames: it reads only the
 `moov` atom and returns the video track's samples (offset and size, in
 presentation order after the first edit), frame rate, creation time and
