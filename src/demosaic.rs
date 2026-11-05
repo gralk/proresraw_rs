@@ -223,7 +223,7 @@ pub fn develop_with(frame: &Frame, params: &DemosaicParams, stage: Stage) -> Rgb
 pub fn develop_into(frame: &Frame, params: &DemosaicParams, stage: Stage, out: &mut [f32]) {
     let (w, h) = (frame.width(), frame.height());
     assert_eq!(out.len(), 3 * w * h, "output size");
-    Conversion::new(frame, params, stage).run_interleaved(frame, out);
+    Conversion::new(&frame.header, params, stage).run_interleaved(frame, out);
 }
 
 /// [`develop_with`] with the result as three planes, the layout most raw
@@ -257,7 +257,7 @@ pub fn develop_planar_into(
     for plane in &out {
         assert_eq!(plane.len(), w * h, "plane size");
     }
-    Conversion::new(frame, params, stage).run_planar(frame, out);
+    Conversion::new(&frame.header, params, stage).run_planar(frame, out);
 }
 
 /// Where one band of [`Conversion`] writes its finished rows: the band's
@@ -270,25 +270,27 @@ enum BandOut<'a> {
 /// Per-band scratch: normalized rows and green-pass rows.
 type Scratch = (Vec<f32>, Vec<[f32; 2]>);
 
-/// Everything the bands of one conversion share.
-struct Conversion {
-    params: DemosaicParams,
-    matrix: Option<[f32; 9]>,
+/// Everything the bands of one conversion share, also used by the GPU
+/// conversion.
+pub(crate) struct Conversion {
+    /// The parameters with the stage applied: no white balance at
+    /// [`Stage::Demosaiced`].
+    pub(crate) params: DemosaicParams,
+    /// The output matrix at [`Stage::Rec2020`].
+    pub(crate) matrix: Option<[f32; 9]>,
     /// Linearization and normalization folded into one table.
-    lut: Vec<f32>,
+    pub(crate) lut: Vec<f32>,
 }
 
 impl Conversion {
-    fn new(frame: &Frame, params: &DemosaicParams, stage: Stage) -> Self {
+    pub(crate) fn new(header: &FrameHeader, params: &DemosaicParams, stage: Stage) -> Self {
         let mut p = *params;
         if stage == Stage::Demosaiced {
             p.wb = [1.0; 2];
             p.clip = [1.0; 2];
         }
-        let matrix =
-            (stage == Stage::Rec2020).then(|| output_matrix(&frame.header, Exposure::Normalized));
-        let lut = frame
-            .header
+        let matrix = (stage == Stage::Rec2020).then(|| output_matrix(header, Exposure::Normalized));
+        let lut = header
             .curve
             .lut()
             .iter()
