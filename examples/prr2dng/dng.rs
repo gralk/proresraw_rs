@@ -51,6 +51,8 @@ pub struct ClipInfo {
     pub fps: Option<(u32, u32)>,
     /// `YYYY:MM:DD HH:MM:SS`, when the movie records its creation time.
     pub date_time: Option<String>,
+    /// How readers turn the stored frame for display, from the track matrix.
+    pub orientation: proresraw_rs::mov::Orientation,
 }
 
 impl ClipInfo {
@@ -151,7 +153,9 @@ fn tags(header: &FrameHeader, clip: &ClipInfo, samples: Samples) -> BTreeMap<u16
     if let Some(model) = &clip.model {
         put(272, Value::Ascii(model.clone()));
     }
-    put(274, Value::Short(vec![1])); // Orientation: top left
+    // Orientation: the image is stored as the camera stored it, and readers
+    // turn it (with its CFA pattern and crop) for display.
+    put(274, Value::Short(vec![clip.orientation.exif().into()]));
     put(277, Value::Short(vec![1])); // SamplesPerPixel
     put(284, Value::Short(vec![1])); // PlanarConfiguration: chunky
     put(

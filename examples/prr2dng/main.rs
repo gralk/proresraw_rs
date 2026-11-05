@@ -142,6 +142,7 @@ impl Clip {
             model: text(&["com.apple.proapps.modelname", "com.apple.quicktime.model"]),
             fps: Some(track.fps),
             date_time: track.creation_time.map(dng::quicktime_date_time),
+            orientation: track.orientation,
         };
         Ok(Self {
             path: path.to_owned(),
@@ -196,6 +197,13 @@ impl Clip {
             "  as shot {:.0} K, white balance {:.4}/{:.4}, baseline exposure {:+.2}",
             colour.temperature, self.header.wb_red, self.header.wb_blue, colour.baseline_exposure,
         );
+        if self.track.orientation != mov::Orientation::Identity {
+            eprintln!(
+                "  display: {:?} (DNG Orientation {})",
+                self.track.orientation,
+                self.track.orientation.exif()
+            );
+        }
         for warning in &self.track.warnings {
             eprintln!("  warning: {warning}");
         }

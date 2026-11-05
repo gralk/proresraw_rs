@@ -180,6 +180,7 @@ table, as in ProRes RAW. Colour comes from the header:
 | `AsShotNeutral` | `(1/wbR, 1, 1/wbB)` |
 | `BaselineExposure` | `log2(gain)` |
 | `DefaultCrop*` | header crop margins |
+| `Orientation` | the video track's display matrix (`mov::Track::orientation`); the image itself is stored as recorded |
 | `Make`, `Model`, `FrameRate`, `DateTime` | movie metadata and track |
 
 The image is stored as 256×256 lossless JPEG tiles, about 1.4× smaller
