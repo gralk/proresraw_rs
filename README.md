@@ -22,7 +22,8 @@ println!("{:?} white {}", frame.header.bayer_pattern, frame.header.white_level);
 
 Demuxing is out of scope: any QuickTime reader that yields samples works.
 `examples/decode.rs` turns a file of concatenated packets (as written by
-`ffmpeg -c:v copy -f rawvideo`) into a 16-bit PGM.
+`ffmpeg -c:v copy -f rawvideo`) into a 16-bit PGM. `examples/prr2dng`
+reads `.mov` clips directly and writes DNG sequences (see below).
 
 ## Status
 
@@ -88,6 +89,42 @@ without the feature the crate forbids unsafe code, and the conversion
 falls back to a library call per fused multiply-add, about half the
 speed unless the build targets FMA itself (`-C target-cpu=x86-64-v3` or
 `native`). Results are bit-identical on every path.
+
+## DNG conversion
+
+`examples/prr2dng` converts clips to DNG image sequences:
+
+```sh
+cargo run --release --example prr2dng -- -o OUT clip1.mov clip2.mov
+```
+
+Frame `n` of `clip1.mov` goes to `OUT/clip1/clip1.nnnnnn.dng` (the
+current directory without `-o`). Every clip is checked first: its video
+track must be `aprn` or `aprh` and its first frame must parse. The
+example includes a small QuickTime reader for this.
+
+Each DNG holds the frame's 16-bit code values with the frame's curve as
+a 65536-entry `LinearizationTable`, so readers linearize exactly as
+`Frame::linearize` does. Black (256) and white levels apply after the
+table, as in ProRes RAW. Colour comes from the header:
+
+| DNG tag | from |
+|---|---|
+| `ColorMatrix1` | header matrix and white balance, its D65 adaptation undone (Bradford) to the header's colour temperature |
+| `ForwardMatrix1` | header matrix adapted from D65 to D50 |
+| `AsShotNeutral` | `(1/wbR, 1, 1/wbB)` |
+| `BaselineExposure` | `log2(gain)` |
+| `DefaultCrop*` | header crop margins |
+| `Make`, `Model`, `FrameRate`, `DateTime` | movie metadata and track |
+
+The image is stored as 256×256 lossless JPEG tiles, about 1.4× smaller
+than uncompressed. `--linear` stores `Frame::linearize()` output with no
+table instead. That is the precision decoders output, and it compresses
+better (a 4K frame takes about 11 MB instead of 15 MB), but it drops the
+code values' sub-LSB detail in the shadows. `--uncompressed`,
+`--frames FIRST-LAST` and `--overwrite` are also available. LibRaw
+decodes the compressed and uncompressed files of every sample clip to
+identical data, and darktable and RawTherapee render them.
 
 ## GPU decoding
 
