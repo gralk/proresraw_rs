@@ -11,8 +11,8 @@
 //! sensor values.
 //!
 //! The implementation follows the bitstream description in
-//! `docs/bitstream.md`. Demuxing is out of scope; any QuickTime reader
-//! that yields samples works.
+//! `docs/bitstream.md`. [`mov`] finds the frames of a QuickTime clip;
+//! any other QuickTime reader that yields samples works as well.
 //!
 //! With the `gpu` feature, [`gpu::GpuDecoder`] decodes on a wgpu device
 //! the application provides and leaves the code values in a GPU buffer.
@@ -39,6 +39,7 @@ pub mod error;
 pub mod gpu;
 pub mod header;
 pub mod idct;
+pub mod mov;
 pub mod reduced;
 /// Synthetic frames for decoder tests, exposed with the `testgen` feature.
 #[cfg(any(test, feature = "testgen"))]

@@ -3,8 +3,81 @@
 //! text metadata. Only the `moov` atom is read into memory; samples are read with
 //! positional I/O ([`read_at`]), so one `File` serves every decoder thread
 //! without a lock.
-use anyhow::{Context, Result, bail, ensure};
-use std::fs::File;
+//!
+//! ```no_run
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! use proresraw_rs::{decode_frame, is_prores_raw_fourcc, mov};
+//! let file = std::fs::File::open("A001_C010.mov")?;
+//! let track = mov::read_video_track(&file, is_prores_raw_fourcc)?;
+//! let first = track.samples[0];
+//! let mut packet = vec![0; first.size as usize];
+//! mov::read_at(&file, first.offset, &mut packet)?;
+//! let frame = decode_frame(&packet)?;
+//! # Ok(())
+//! # }
+//! ```
+use std::{fmt, fs::File};
+
+/// Why a movie could not be read: a message naming the atom or structure at
+/// fault, with the context it was read in, outermost first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Error(String);
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for Error {}
+impl From<std::io::Error> for Error {
+    fn from(e: std::io::Error) -> Self {
+        Self(e.to_string())
+    }
+}
+impl From<std::array::TryFromSliceError> for Error {
+    fn from(e: std::array::TryFromSliceError) -> Self {
+        Self(e.to_string())
+    }
+}
+
+/// The result of reading a movie.
+pub type Result<T> = std::result::Result<T, Error>;
+
+/// Return an [`Error`] with a formatted message.
+macro_rules! bail {
+    ($($message:tt)+) => {
+        return Err(Error(format!($($message)+)))
+    };
+}
+/// [`bail!`] unless `condition` holds.
+macro_rules! ensure {
+    ($condition:expr, $($message:tt)+) => {
+        if !$condition {
+            bail!($($message)+);
+        }
+    };
+}
+/// Context for a missing value or a failure: `context: cause`.
+trait Context<T> {
+    fn context(self, message: impl fmt::Display) -> Result<T>;
+    fn with_context<M: fmt::Display>(self, message: impl FnOnce() -> M) -> Result<T>;
+}
+impl<T> Context<T> for Option<T> {
+    fn context(self, message: impl fmt::Display) -> Result<T> {
+        self.ok_or_else(|| Error(message.to_string()))
+    }
+    fn with_context<M: fmt::Display>(self, message: impl FnOnce() -> M) -> Result<T> {
+        self.ok_or_else(|| Error(message().to_string()))
+    }
+}
+impl<T, E: fmt::Display> Context<T> for std::result::Result<T, E> {
+    fn context(self, message: impl fmt::Display) -> Result<T> {
+        self.map_err(|e| Error(format!("{message}: {e}")))
+    }
+    fn with_context<M: fmt::Display>(self, message: impl FnOnce() -> M) -> Result<T> {
+        self.map_err(|e| Error(format!("{}: {e}", message())))
+    }
+}
 
 /// Larger `moov` atoms are refused rather than read: real movies' are tens of KB.
 const MAX_MOOV: u64 = 64 << 20;
@@ -18,15 +91,22 @@ const FIRST_ATOMS: [&[u8; 4]; 7] = [
 /// Where one sample's bytes are in the file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Sample {
+    /// Byte offset of the sample in the file.
     pub offset: u64,
+    /// The sample's length in bytes.
     pub size: u32,
 }
 
+/// One video track of a movie: its format, rate, samples and the movie's
+/// metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Track {
+    /// The sample description's fourcc, such as `aprh`.
     pub fourcc: [u8; 4],
     /// Media timescale over the most common sample duration, reduced.
     pub fps: (u32, u32),
+    /// Whether the samples' durations differ (the iPhone records this way);
+    /// [`Self::fps`] is then the most common one.
     pub variable_durations: bool,
     /// Byte offset and size of each presented sample, in order.
     pub samples: Vec<Sample>,

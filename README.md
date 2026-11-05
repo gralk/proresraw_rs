@@ -20,7 +20,11 @@ let linear = frame.linearize();                      // width * height u16
 println!("{:?} white {}", frame.header.bayer_pattern, frame.header.white_level);
 ```
 
-Demuxing is out of scope: any QuickTime reader that yields samples works.
+`mov::read_video_track` finds a clip's frames: it reads only the
+`moov` atom and returns the video track's samples (offset and size, in
+presentation order after the first edit), frame rate, creation time and
+the movie's text metadata, and `mov::read_at` reads a sample from any
+thread. Any other QuickTime reader that yields samples works as well.
 `examples/decode.rs` turns a file of concatenated packets (as written by
 `ffmpeg -c:v copy -f rawvideo`) into a 16-bit PGM. `examples/prr2dng`
 reads `.mov` clips directly and writes DNG sequences (see below).
@@ -107,8 +111,8 @@ speed unless the build targets FMA itself (`-C target-cpu=x86-64-v3` or
 ## DNG conversion
 
 `examples/prr2dng` is a command-line tool that converts ProRes RAW
-`.mov` clips to DNG image sequences. It reads the clips itself (the
-example includes a small QuickTime reader), so no FFmpeg step is needed.
+`.mov` clips to DNG image sequences. It reads the clips with the
+crate's `mov` reader, so no FFmpeg step is needed.
 
 ### Building
 
@@ -233,7 +237,8 @@ The modules follow it: `header` (§3), `tile` (§4–5), `bits` and
 `codebook` (§6.0–6.1), `coefficients` (§6.2–6.4), `idct` (§7), `curve`
 (§8) and `decoder` (§2, placement). `gpu` and `gpu/decode.wgsl` mirror
 §6–7 on the GPU; the shader's tables are generated from `codebook` and
-`idct`. No unsafe code.
+`idct`. `mov` is the QuickTime container reader, outside the bitstream
+description. No unsafe code.
 
 Random frames from `synth` (every alignment and Bayer pattern, extreme
 quantizers, invalid tiles) must decode identically on the host and the

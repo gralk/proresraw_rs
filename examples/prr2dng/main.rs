@@ -23,7 +23,6 @@
 mod colour;
 mod dng;
 mod lj92;
-mod mov;
 mod tiff;
 
 use std::fs::File;
@@ -32,7 +31,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::{Context, Result, bail, ensure};
-use proresraw_rs::{FrameHeader, decode_frame, is_prores_raw_fourcc, parse_frame};
+use proresraw_rs::{FrameHeader, decode_frame, is_prores_raw_fourcc, mov, parse_frame};
 
 const USAGE: &str = "usage: prr2dng [-o DIR] [--linear] [--uncompressed] [--frames FIRST[-[LAST]]] [--overwrite] \
      CLIP.mov...";
