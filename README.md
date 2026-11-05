@@ -25,6 +25,20 @@ Demuxing is out of scope: any QuickTime reader that yields samples works.
 `ffmpeg -c:v copy -f rawvideo`) into a 16-bit PGM. `examples/prr2dng`
 reads `.mov` clips directly and writes DNG sequences (see below).
 
+### Orientation
+
+A frame is decoded as the camera stored it. The header's width, height,
+Bayer pattern and crop all describe that stored frame, and nothing in
+the frame says which way is up: display orientation is recorded only by
+the container, in the video track's display matrix (`tkhd`). Recorders
+can store frames turned. The Blackmagic Camera app on the iPhone 17 Pro
+stores 4:3 frames upside down and marks the track as turned 180°
+(matrix `[-1 0; 0 -1]`), while its 16:9 frames are stored upright. The
+frame headers of the two are otherwise alike. A reader that ignores the
+matrix shows those clips upside down. Turn the picture after decoding,
+and remember that the Bayer pattern and crop turn with it (RGGB turned
+180° is BGGR).
+
 ## Status
 
 - Bitstream versions 0 (Atomos recorders) and 1 (iPhone 17) decode.
