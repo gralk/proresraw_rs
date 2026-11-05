@@ -263,6 +263,46 @@ parallel host decoder on the same machine:
 
 Entropy decoding is serial within a stream and dominates the GPU time.
 
+### Raw conversion on the GPU
+
+`GpuDeveloper` runs the raw conversion on the decoded buffer, so a frame
+can go from packet to developed RGB without leaving the GPU:
+
+```rust
+let mut developer = proresraw_rs::GpuDeveloper::new(&device);
+let frame = decoder.decode(&device, &queue, &packet)?;
+let params = proresraw_rs::DemosaicParams::new(&frame.header, frame.quantizer());
+let stage = proresraw_rs::Stage::Demosaiced;
+let rgb = developer.develop(&device, &queue, &frame, &params, stage)?;
+// rgb.planes: three f32 storage buffers (R, G, B), width * height each
+let planes = rgb.download(&device, &queue)?; // or download_into reused slices
+```
+
+`develop_into` writes into planes the caller allocates, and
+`develop_frame` uploads a host `Frame` instead. The output is
+`develop_planar`'s, bit for bit: the shader repeats the host's operations
+in the host's order, with fused multiply-adds where the host fuses them,
+divisions and square roots corrected to the correctly rounded result
+that WGSL does not promise, and partial sums kept opaque so that the
+driver cannot fuse or reassociate them. On an RTX 3060 (Vulkan) the
+planes are bit-identical to the host's on every test frame and every
+stage.
+
+Time per frame on the same RTX 3060, against the host conversion into
+reused buffers (32 threads, loaded machine):
+
+| clip | size | GPU | host |
+|---|---|---|---|
+| Panasonic S5 via Atomos, HQ | 5888×3312 | 4.3 ms | 90–100 ms |
+| Sony a7S III via Atomos, HQ | 4264×2408 | 2.3 ms | 45–60 ms |
+| Sony FX6 via Ninja V | 3872×2192 | 1.9 ms | 50–60 ms |
+
+Downloading the planes takes far longer than the conversion: 85–155 ms
+for these frames into reused slices, limited by host reads of the mapped
+staging memory, which wgpu does not let the crate choose. The GPU path
+pays off most when the next stage also runs on the GPU and reads the
+planes in place.
+
 ## Design
 
 `docs/bitstream.md` is the format description the code is written from.
@@ -270,7 +310,7 @@ The modules follow it: `header` (§3), `tile` (§4–5), `bits` and
 `codebook` (§6.0–6.1), `coefficients` (§6.2–6.4), `idct` (§7), `curve`
 (§8) and `decoder` (§2, placement). `gpu` and `gpu/decode.wgsl` mirror
 §6–7 on the GPU; the shader's tables are generated from `codebook` and
-`idct`. `mov` is the QuickTime container reader, outside the bitstream
+`idct`. `gpu/develop.wgsl` mirrors the raw conversion in `demosaic`. `mov` is the QuickTime container reader, outside the bitstream
 description. No unsafe code.
 
 Random frames from `synth` (every alignment and Bayer pattern, extreme
