@@ -19,6 +19,10 @@ pub struct ParsedFrame<'a> {
     pub grid: TileGrid,
     /// Tile payloads in frame order.
     pub tiles: Vec<&'a [u8]>,
+    /// Largest qscale byte over all tiles, read from the second byte of
+    /// every tile whether or not its header is valid, as Apple's decoder
+    /// does. It is the quantizer of Apple's demosaic noise model.
+    pub max_qscale: u8,
 }
 
 /// Split a packet into its header and tiles without decoding them.
@@ -65,8 +69,11 @@ pub fn parse_frame(packet: &[u8]) -> Result<ParsedFrame<'_>> {
     })?;
     let mut offset = table_end;
     let mut tiles = Vec::with_capacity(grid.len());
+    let mut max_qscale = 0;
     for (index, size) in table.chunks_exact(2).enumerate() {
         let size = usize::from(u16::from_be_bytes([size[0], size[1]]));
+        // The byte after the tile start, even for a tile too short to hold it.
+        max_qscale = max_qscale.max(packet.get(offset + 1).copied().unwrap_or(0));
         let tile = packet
             .get(offset..offset + size)
             .ok_or(Error::TileOutOfBounds { tile: index })?;
@@ -77,6 +84,7 @@ pub fn parse_frame(packet: &[u8]) -> Result<ParsedFrame<'_>> {
         header,
         grid,
         tiles,
+        max_qscale,
     })
 }
 
