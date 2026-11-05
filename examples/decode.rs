@@ -3,10 +3,10 @@
 //! write it as a 16-bit binary PGM.
 //!
 //! Usage: `decode FRAMES.bin OUT.pgm [--frame N] [--linear] [--gpu]
-//! [--scale half|quarter|eighth] [--develop STAGE]`
+//! [--scale half|quarter|eighth [--average-greens]] [--develop STAGE]`
 //!
 //! `--scale` decodes at reduced resolution and writes a 16-bit binary PPM
-//! of linear RGB instead. `--develop STAGE` runs the raw conversion up to
+//! of linear RGB instead; `--average-greens` reads both green streams. `--develop STAGE` runs the raw conversion up to
 //! `demosaiced`, `white-balanced` or `rec2020` and writes a float PFM.
 //!
 //! `--gpu` (feature `gpu`) decodes on the default wgpu adapter and reports
@@ -14,7 +14,7 @@
 
 use std::process::ExitCode;
 
-use proresraw_rs::{Scale, decode_frame, decode_frame_reduced, parse_frame};
+use proresraw_rs::{Greens, Scale, decode_frame, decode_frame_reduced_with, parse_frame};
 
 fn main() -> ExitCode {
     match run() {
@@ -34,12 +34,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut linear = false;
     let mut gpu = false;
     let mut scale = None;
+    let mut greens = Greens::First;
     let mut develop = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--frame" => frame_index = args.next().ok_or("--frame needs a number")?.parse()?,
             "--linear" => linear = true,
             "--gpu" => gpu = true,
+            "--average-greens" => greens = Greens::Average,
             "--develop" => {
                 develop = Some(match args.next().as_deref() {
                     Some("demosaiced") => proresraw_rs::Stage::Demosaiced,
@@ -66,9 +68,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("{} tiles", parsed.tiles.len());
     if let Some(scale) = scale {
         let start = std::time::Instant::now();
-        let rgb = decode_frame_reduced(packet, scale)?;
+        let rgb = decode_frame_reduced_with(packet, scale, greens)?;
         eprintln!(
-            "decoded {scale:?} in {:.1} ms",
+            "decoded {scale:?} ({greens:?} greens) in {:.1} ms",
             start.elapsed().as_secs_f64() * 1e3
         );
         let mut ppm = format!("P6\n{} {}\n65535\n", rgb.width(), rgb.height()).into_bytes();

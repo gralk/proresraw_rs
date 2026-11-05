@@ -57,7 +57,7 @@ pub use error::{Error, Result};
 pub use gpu::{GpuDecoder, GpuError, GpuFrame};
 pub use header::{BLACK_LEVEL, BayerPattern, Color, Crop, FrameHeader};
 pub use idct::Idct;
-pub use reduced::{RgbFrame, Scale, decode_frame_reduced};
+pub use reduced::{Greens, RgbFrame, Scale, decode_frame_reduced, decode_frame_reduced_with};
 
 /// QuickTime sample description FourCCs of ProRes RAW tracks.
 pub const FOURCCS: [&[u8; 4]; 2] = [b"aprn", b"aprh"];

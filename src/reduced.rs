@@ -4,7 +4,10 @@
 //! Each output pixel covers one 2×2 Bayer cell (half), 4×4 sensels
 //! (quarter) or 8×8 sensels (eighth). Its red, green and blue come from
 //! the red stream, the first green stream and the blue stream of the tile;
-//! the second green stream is not decoded. Quarter and eighth resolution
+//! the second green stream is not decoded. Half resolution is therefore a
+//! sub-sample of the mosaic, not a box filter: fine for previews, but
+//! [`Greens::Average`] also decodes the second green stream and averages
+//! the two, for about a third more work. Quarter and eighth resolution
 //! decode only the leading 16 or 4 coefficients of every block and run a
 //! 4×4 or 2×2 inverse transform on them, so they cost a fraction of a full
 //! decode. Values are linearized with the frame's curve, like
@@ -57,6 +60,17 @@ impl Scale {
     }
 }
 
+/// Which green streams a reduced decode reads.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum Greens {
+    /// The first green stream only, as Apple's decoder does for previews.
+    #[default]
+    First,
+    /// Both green streams, averaged after linearization and rounded half
+    /// up: `(g1 + g2 + 1) / 2`. Costs a fourth stream decode.
+    Average,
+}
+
 /// A reduced-resolution decode: linear RGB, three samples per pixel.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RgbFrame {
@@ -64,6 +78,8 @@ pub struct RgbFrame {
     pub header: FrameHeader,
     /// The output scale.
     pub scale: Scale,
+    /// The green streams the decode read.
+    pub greens: Greens,
     /// Linear R, G, B sensor values, interleaved, row-major over
     /// [`RgbFrame::stride`] × the coded height divided by the scale
     /// factor (padding of the last tiles included). Black and white levels
@@ -116,8 +132,13 @@ impl RgbFrame {
 }
 
 /// Decode one frame packet at a reduced resolution with the
-/// Apple-compatible inverse transforms.
+/// Apple-compatible inverse transforms, green from the first green stream.
 pub fn decode_frame_reduced(packet: &[u8], scale: Scale) -> Result<RgbFrame> {
+    decode_frame_reduced_with(packet, scale, Greens::First)
+}
+
+/// [`decode_frame_reduced`] reading the green streams `greens` says.
+pub fn decode_frame_reduced_with(packet: &[u8], scale: Scale, greens: Greens) -> Result<RgbFrame> {
     let parsed = parse_frame(packet)?;
     let header = parsed.header;
     let shift = scale.log2_factor();
@@ -140,6 +161,7 @@ pub fn decode_frame_reduced(packet: &[u8], scale: Scale) -> Result<RgbFrame> {
                         qmat,
                         lut: &lut,
                         scale,
+                        greens,
                         base,
                         stride,
                     };
@@ -165,6 +187,7 @@ pub fn decode_frame_reduced(packet: &[u8], scale: Scale) -> Result<RgbFrame> {
     Ok(RgbFrame {
         header,
         scale,
+        greens,
         samples,
         skipped_tiles: skipped.concat(),
         max_qscale: parsed.max_qscale,
@@ -176,14 +199,15 @@ struct TileContext<'a> {
     qmat: &'a [u8; 64],
     lut: &'a [u16; 65536],
     scale: Scale,
+    greens: Greens,
     base: usize,
     /// Output row stride in pixels.
     stride: usize,
 }
 
 impl TileContext<'_> {
-    /// Decode the red, first green and blue streams of one tile into the
-    /// tile row `rows`.
+    /// Decode the red, green and blue streams of one tile into the tile
+    /// row `rows`.
     fn decode(&self, tile: &Tile<'_>, geometry: TileGeometry, rows: &mut [u16]) {
         // qmat <= 63 and qscale <= 255 are validated, so the product fits i16.
         let q: [i16; 64] =
@@ -195,8 +219,14 @@ impl TileContext<'_> {
         let x0 = geometry.x >> self.scale.log2_factor();
         let mut coefs = [0i16; 64 * MAX_BLOCKS];
         let coefs = &mut coefs[..per_block * blocks];
-        // Streams are stored green, green, blue, red.
-        for (channel, stream) in [(0, 3), (1, 0), (2, 2)] {
+        // Streams are stored green, green, blue, red. The second green,
+        // when read, is averaged into the first.
+        let both = self.greens == Greens::Average;
+        let plan = [(0, 3, false), (1, 0, false), (1, 1, true), (2, 2, false)];
+        for (channel, stream, average) in plan {
+            if average && !both {
+                continue;
+            }
             let data = tile.streams[stream];
             let align = (data.as_ptr() as usize).wrapping_sub(self.base) & 3;
             decode_component_reduced(data, align, geometry.log2_blocks, log2_coefs, coefs);
@@ -220,8 +250,16 @@ impl TileContext<'_> {
                 let bx = x0 + b * side;
                 for (i, line) in values.chunks_exact(side).enumerate() {
                     let start = 3 * (i * self.stride + bx) + channel;
-                    for (d, &v) in rows[start..].iter_mut().step_by(3).zip(line) {
-                        *d = self.lut[usize::from(v)];
+                    let dst = rows[start..].iter_mut().step_by(3).zip(line);
+                    if average {
+                        for (d, &v) in dst {
+                            let sum = u32::from(*d) + u32::from(self.lut[usize::from(v)]);
+                            *d = sum.div_ceil(2) as u16;
+                        }
+                    } else {
+                        for (d, &v) in dst {
+                            *d = self.lut[usize::from(v)];
+                        }
                     }
                 }
             }
@@ -263,15 +301,46 @@ mod tests {
         }
     }
 
+    /// With both greens, a half-size pixel's green is the rounded mean of
+    /// the two green sensels of its Bayer cell; red and blue are as before.
+    #[test]
+    fn half_resolution_can_average_the_greens() {
+        let mut rng = Rng::new(12);
+        for spec in specs(&mut rng) {
+            let spec = Spec {
+                valid_tiles: true,
+                ..spec
+            };
+            let packet = random_frame(&spec, &mut rng);
+            let full = decode_frame(&packet).unwrap();
+            let linear = full.linearize();
+            let width = full.width();
+            let [g1, g2, b, r] = full.header.bayer_pattern.stream_phases();
+            let rgb = decode_frame_reduced_with(&packet, Scale::Half, Greens::Average).unwrap();
+            assert_eq!(rgb.greens, Greens::Average);
+            for y in 0..rgb.height() {
+                for x in 0..rgb.width() {
+                    let at = |(pr, pc): (usize, usize)| linear[(2 * y + pr) * width + 2 * x + pc];
+                    let g = (u32::from(at(g1)) + u32::from(at(g2))).div_ceil(2) as u16;
+                    let px = &rgb.row(y)[3 * x..3 * x + 3];
+                    assert_eq!(px, [at(r), g, at(b)], "{:?} ({x},{y})", spec.pattern);
+                }
+            }
+        }
+    }
+
     #[test]
     fn reduced_sizes_and_skipped_tiles() {
         let mut rng = Rng::new(8);
         for spec in specs(&mut rng) {
             let packet = random_frame(&spec, &mut rng);
             let full = decode_frame(&packet).unwrap();
-            for scale in [Scale::Half, Scale::Quarter, Scale::Eighth] {
+            let modes = [Scale::Half, Scale::Quarter, Scale::Eighth]
+                .into_iter()
+                .flat_map(|s| [(s, Greens::First), (s, Greens::Average)]);
+            for (scale, greens) in modes {
                 let f = scale.factor();
-                let rgb = decode_frame_reduced(&packet, scale).unwrap();
+                let rgb = decode_frame_reduced_with(&packet, scale, greens).unwrap();
                 assert_eq!(rgb.width(), full.width() / f);
                 assert_eq!(rgb.height(), full.height() / f);
                 assert_eq!(

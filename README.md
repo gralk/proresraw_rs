@@ -76,6 +76,14 @@ are Apple-compatible bit for bit; half resolution equals the full decode
 sampled at the red, first green and blue sensels. On a 4K frame, half,
 quarter and eighth take about 16, 7 and 4 ms.
 
+Half resolution is thus a sub-sample of each Bayer cell, not a box
+filter. That suits previews; for half-size output meant for more,
+`decode_frame_reduced_with(packet, scale, Greens::Average)` also decodes
+the second green stream and averages the two greens, for 10–30 % more
+time. Output rows are padded to the coded width: read them in place with
+`RgbFrame::row` and `stride`, or copy the visible pixels out with
+`to_packed`.
+
 ## Raw conversion
 
 `develop(&frame, stage)` runs Apple's standard raw conversion and
