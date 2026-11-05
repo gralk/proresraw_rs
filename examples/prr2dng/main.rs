@@ -10,6 +10,7 @@
 //! - `-o`, `--output DIR`: where the per-clip folders go (default: the
 //!   current directory).
 
+mod colour;
 mod mov;
 
 use std::fs::File;
@@ -138,6 +139,11 @@ fn run() -> Result<()> {
                 &camera
             },
             options.output.join(&clip.name).display(),
+        );
+        let colour = colour::DngColour::new(&clip.header);
+        eprintln!(
+            "  as shot {:.0} K, white balance {:.4}/{:.4}, baseline exposure {:+.2}",
+            colour.temperature, clip.header.wb_red, clip.header.wb_blue, colour.baseline_exposure,
         );
         for warning in &clip.track.warnings {
             eprintln!("  warning: {warning}");
