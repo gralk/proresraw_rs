@@ -92,16 +92,59 @@ speed unless the build targets FMA itself (`-C target-cpu=x86-64-v3` or
 
 ## DNG conversion
 
-`examples/prr2dng` converts clips to DNG image sequences:
+`examples/prr2dng` is a command-line tool that converts ProRes RAW
+`.mov` clips to DNG image sequences. It reads the clips itself (the
+example includes a small QuickTime reader), so no FFmpeg step is needed.
+
+### Building
 
 ```sh
-cargo run --release --example prr2dng -- -o OUT clip1.mov clip2.mov
+cargo build --release --example prr2dng
 ```
 
-Frame `n` of `clip1.mov` goes to `OUT/clip1/clip1.nnnnnn.dng` (the
-current directory without `-o`). Every clip is checked first: its video
-track must be `aprn` or `aprh` and its first frame must parse. The
-example includes a small QuickTime reader for this.
+The binary is `target/release/examples/prr2dng`. To put it on your
+`PATH` (in `~/.cargo/bin`), install it instead:
+
+```sh
+cargo install --path . --example prr2dng
+```
+
+### Usage
+
+```
+prr2dng [-o DIR] [--linear] [--uncompressed] [--frames FIRST[-[LAST]]] [--overwrite] CLIP.mov...
+```
+
+| option | effect |
+|---|---|
+| `-o`, `--output DIR` | folder for the per-clip sequences (default: the current directory) |
+| `--linear` | store linear values with no `LinearizationTable` (see below) |
+| `--uncompressed` | store uncompressed samples instead of lossless JPEG |
+| `--frames N`, `N-M`, `N-` | convert only these frames (0-based, inclusive) |
+| `--overwrite` | replace existing DNG files instead of stopping |
+
+Frame `n` of `CLIP.mov` is written to `DIR/CLIP/CLIP.nnnnnn.dng`,
+numbered by its frame index in the clip. For example:
+
+```sh
+# Every frame of two clips, into ./A001_C010/ and ./A001_C011/
+prr2dng A001_C010.mov A001_C011.mov
+
+# Frames 100 to 199 of one clip, into /scratch/dng/A001_C010/
+prr2dng -o /scratch/dng --frames 100-199 A001_C010.mov
+```
+
+Every clip is checked before anything is written: its video track must
+be `aprn` or `aprh` and its first frame must parse, so a wrong file
+stops the run up front. For each clip the tool prints the format,
+frame count, frame rate, camera, as-shot white balance and exposure,
+then its progress. Existing files stop the run unless `--overwrite` is
+given; files are written under a temporary name and renamed when
+complete, so an interrupted run leaves no truncated DNGs. A frame that
+fails to decode is reported and skipped, and the tool then exits with an
+error status.
+
+### What the files contain
 
 Each DNG holds the frame's 16-bit code values with the frame's curve as
 a 65536-entry `LinearizationTable`, so readers linearize exactly as
@@ -121,10 +164,9 @@ The image is stored as 256×256 lossless JPEG tiles, about 1.4× smaller
 than uncompressed. `--linear` stores `Frame::linearize()` output with no
 table instead. That is the precision decoders output, and it compresses
 better (a 4K frame takes about 11 MB instead of 15 MB), but it drops the
-code values' sub-LSB detail in the shadows. `--uncompressed`,
-`--frames FIRST-LAST` and `--overwrite` are also available. LibRaw
-decodes the compressed and uncompressed files of every sample clip to
-identical data, and darktable and RawTherapee render them.
+code values' sub-LSB detail in the shadows. LibRaw decodes the
+compressed and uncompressed files of every sample clip to identical
+data, and darktable and RawTherapee render them.
 
 ## GPU decoding
 
