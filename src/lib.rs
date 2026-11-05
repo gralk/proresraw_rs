@@ -29,6 +29,7 @@ pub mod codebook;
 pub mod coefficients;
 pub mod curve;
 pub mod decoder;
+pub mod demosaic;
 pub mod error;
 #[cfg(feature = "gpu")]
 pub mod gpu;
@@ -42,6 +43,7 @@ pub mod tile;
 
 pub use curve::Curve;
 pub use decoder::{Frame, ParsedFrame, decode_frame, decode_frame_with, parse_frame};
+pub use demosaic::{DemosaicParams, Exposure, frame_quantizer};
 pub use error::{Error, Result};
 #[cfg(feature = "gpu")]
 pub use gpu::{GpuDecoder, GpuError, GpuFrame};

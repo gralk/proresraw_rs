@@ -21,7 +21,8 @@ pub struct ParsedFrame<'a> {
     pub tiles: Vec<&'a [u8]>,
     /// Largest qscale byte over all tiles, read from the second byte of
     /// every tile whether or not its header is valid, as Apple's decoder
-    /// does. It is the quantizer of Apple's demosaic noise model.
+    /// does. Drives the demosaic noise model
+    /// ([`crate::demosaic::frame_quantizer`]).
     pub max_qscale: u8,
 }
 
