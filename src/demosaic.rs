@@ -75,7 +75,8 @@ pub struct DemosaicParams {
 
 impl DemosaicParams {
     /// Parameters for a frame with the given header and quantizer
-    /// ([`frame_quantizer`]), using the header's white balance.
+    /// ([`Frame::quantizer`], or [`frame_quantizer`] for a parsed packet),
+    /// using the header's white balance.
     pub fn new(header: &FrameHeader, quantizer: u32) -> Self {
         Self::with_white_balance(header, quantizer, header.wb_red, header.wb_blue)
     }
@@ -164,17 +165,17 @@ pub struct RgbImage {
 
 /// Run Apple's raw conversion on a decoded frame up to `stage`, with the
 /// header's white balance and gain. The quantizer for the noise model
-/// comes from [`frame_quantizer`].
+/// is the frame's own ([`Frame::quantizer`]).
 ///
 /// ```no_run
 /// # let packet = std::fs::read("frame.bin").unwrap();
-/// use proresraw_rs::{Stage, decode_frame, develop, frame_quantizer, parse_frame};
+/// use proresraw_rs::{Stage, decode_frame, develop};
 /// let frame = decode_frame(&packet).unwrap();
-/// let q = frame_quantizer(&parse_frame(&packet).unwrap());
-/// let camera = develop(&frame, q, Stage::Demosaiced); // no white balance
+/// let camera = develop(&frame, Stage::Demosaiced); // no white balance
 /// ```
-pub fn develop(frame: &Frame, quantizer: u32, stage: Stage) -> RgbImage {
-    develop_with(frame, &DemosaicParams::new(&frame.header, quantizer), stage)
+pub fn develop(frame: &Frame, stage: Stage) -> RgbImage {
+    let params = DemosaicParams::new(&frame.header, frame.quantizer());
+    develop_with(frame, &params, stage)
 }
 
 /// Like [`develop`] with explicit parameters, for example white balance
@@ -737,15 +738,15 @@ mod tests {
         };
         let packet = crate::synth::random_frame(&spec, &mut rng);
         let frame = crate::decode_frame(&packet).unwrap();
-        let q = frame_quantizer(&crate::parse_frame(&packet).unwrap());
-        let img = develop(&frame, q, Stage::Demosaiced);
+        let q = frame.quantizer();
+        let img = develop(&frame, Stage::Demosaiced);
         let plain = DemosaicParams::with_white_balance(&frame.header, q, 1.0, 1.0);
         let (w, h) = (frame.width(), frame.height());
         let demosaiced = chroma_pass(&green_pass(&frame.linearize(), w, h, &plain), w, h, &plain);
         assert_eq!(img.data, demosaiced);
-        let balanced = develop(&frame, q, Stage::WhiteBalanced).data;
+        let balanced = develop(&frame, Stage::WhiteBalanced).data;
         assert_ne!(img.data, balanced);
-        let rec2020 = develop(&frame, q, Stage::Rec2020).data;
+        let rec2020 = develop(&frame, Stage::Rec2020).data;
         let m = output_matrix(&frame.header, Exposure::Normalized);
         assert_eq!(rec2020, apply_matrix(&balanced, &m));
     }
@@ -759,9 +760,8 @@ mod tests {
         };
         let packet = crate::synth::random_frame(&spec, &mut rng);
         let frame = crate::decode_frame(&packet).unwrap();
-        let q = frame_quantizer(&crate::parse_frame(&packet).unwrap());
-        assert!(q > 0);
-        let img = develop(&frame, q, Stage::default());
+        assert!(frame.quantizer() > 0);
+        let img = develop(&frame, Stage::default());
         assert_eq!(
             (img.width, img.height, img.data.len()),
             (48, 32, 48 * 32 * 3)

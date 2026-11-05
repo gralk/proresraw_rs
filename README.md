@@ -78,9 +78,9 @@ quarter and eighth take about 16, 7 and 4 ms.
 
 ## Raw conversion
 
-`develop(&frame, frame_quantizer(&parsed), stage)` runs Apple's standard
-raw conversion and returns `f32` RGB. `stage` says how far to go; each
-stage includes the ones before it:
+`develop(&frame, stage)` runs Apple's standard raw conversion and
+returns `f32` RGB. `stage` says how far to go; each stage includes the
+ones before it:
 
 | `Stage` | output |
 |---|---|
@@ -95,9 +95,9 @@ for example your own white balance gains. The passes are also public
 `output_matrix(&header, Exposure::Reflection)` for Apple's other exposure
 scaling).
 
-The quantizer (first quantization matrix entry times the largest tile
-qscale, invalid tiles included) equals the value Apple's decoder computes
-on every sample clip. Compared with GPU runs of Apple's conversion on 4K
+The quantizer (`Frame::quantizer`: the first quantization matrix entry
+times the largest tile qscale, invalid tiles included) equals the value
+Apple's decoder computes on every sample clip. Compared with GPU runs of Apple's conversion on 4K
 frames, the matrix pass is bit-exact on the same input and the demosaic
 passes agree to within 2·10⁻⁷ on a 0–1 scale. The remaining differences
 come from GPU division rounding, which varies between GPUs. Log and HLG

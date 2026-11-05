@@ -86,11 +86,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
     if let Some(stage) = develop {
         let start = std::time::Instant::now();
-        let q = proresraw_rs::frame_quantizer(&parsed);
-        let rgb = proresraw_rs::develop(&frame, q, stage);
+        let rgb = proresraw_rs::develop(&frame, stage);
         eprintln!(
-            "developed in {:.1} ms (quantizer {q})",
-            start.elapsed().as_secs_f64() * 1e3
+            "developed in {:.1} ms (quantizer {})",
+            start.elapsed().as_secs_f64() * 1e3,
+            frame.quantizer()
         );
         // PFM stores rows bottom to top.
         let mut pfm = format!("PF\n{} {}\n-1.0\n", rgb.width, rgb.height).into_bytes();
