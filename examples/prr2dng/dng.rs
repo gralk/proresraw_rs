@@ -6,13 +6,32 @@
 //! `LinearizationTable`, so a reader linearizes exactly as the decoder does
 //! and the code values themselves survive. Black (256) and white levels are
 //! in the linear domain in both formats.
+//!
+//! The image is stored uncompressed in one strip, or as 256×256 tiles of
+//! lossless JPEG (DNG compression 7).
 
 use std::collections::BTreeMap;
+
+use rayon::prelude::*;
 
 use proresraw_rs::{BLACK_LEVEL, Color, Frame, FrameHeader};
 
 use crate::colour::DngColour;
+use crate::lj92;
 use crate::tiff::{self, Layout, Value};
+
+/// Side of the square lossless JPEG tiles: a multiple of 16, as TIFF
+/// requires, and the size DNG writers commonly use.
+const TILE: usize = 256;
+
+/// How the image data is stored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Compression {
+    /// One uncompressed strip.
+    None,
+    /// Lossless JPEG tiles.
+    LosslessJpeg,
+}
 
 /// What the samples hold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,13 +71,57 @@ impl ClipInfo {
 }
 
 /// The DNG file of `frame`.
-pub fn write(frame: &Frame, clip: &ClipInfo, samples: Samples) -> Vec<u8> {
+pub fn write(
+    frame: &Frame,
+    clip: &ClipInfo,
+    samples: Samples,
+    compression: Compression,
+) -> Vec<u8> {
     let mut tags = tags(&frame.header, clip, samples);
-    tags.insert(259, Value::Short(vec![1])); // Compression: none
     let values = visible_samples(frame, samples);
-    let data = values.iter().flat_map(|v| v.to_le_bytes()).collect();
-    let rows = frame.height() as u32;
-    tiff::write(tags, Layout::Strips { rows }, &[data])
+    let (width, height) = (frame.width(), frame.height());
+    match compression {
+        Compression::None => {
+            tags.insert(259, Value::Short(vec![1]));
+            let data = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let rows = height as u32;
+            tiff::write(tags, Layout::Strips { rows }, &[data])
+        }
+        Compression::LosslessJpeg => {
+            tags.insert(259, Value::Short(vec![7]));
+            let across = width.div_ceil(TILE);
+            let tiles: Vec<Vec<u8>> = (0..across * height.div_ceil(TILE))
+                .into_par_iter()
+                .map(|i| {
+                    let tile = tile(&values, width, height, i % across * TILE, i / across * TILE);
+                    lj92::encode(&tile, TILE, TILE, 2)
+                })
+                .collect();
+            let side = TILE as u32;
+            tiff::write(
+                tags,
+                Layout::Tiles {
+                    width: side,
+                    height: side,
+                },
+                &tiles,
+            )
+        }
+    }
+}
+
+/// The `TILE`-square tile at (`left`, `top`) of an even-sized CFA image.
+/// Sensels past the right or bottom edge repeat the nearest edge sensel of
+/// the same colour, which keeps the padding cheap to code.
+fn tile(values: &[u16], width: usize, height: usize, left: usize, top: usize) -> Vec<u16> {
+    // The last column or row of the same CFA phase as `i`, for `i` past `n`.
+    let clamp = |i: usize, n: usize| if i < n { i } else { n - 2 + (i - n) % 2 };
+    let mut tile = Vec::with_capacity(TILE * TILE);
+    for y in top..top + TILE {
+        let row = &values[clamp(y, height) * width..][..width];
+        tile.extend((left..left + TILE).map(|x| row[clamp(x, width)]));
+    }
+    tile
 }
 
 /// The visible picture, row by row, as the file stores it.
@@ -167,6 +230,18 @@ pub fn quicktime_date_time(seconds: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn padding_repeats_the_edge_of_the_same_colour() {
+        // A 4×2 image whose value is its column plus 10 × its row.
+        let values: Vec<u16> = (0..8).map(|i| (i % 4 + 10 * (i / 4)) as u16).collect();
+        let tile = tile(&values, 4, 2, 0, 0);
+        assert_eq!(&tile[..8], [0, 1, 2, 3, 2, 3, 2, 3]);
+        assert_eq!(&tile[TILE..TILE + 4], [10, 11, 12, 13]);
+        // Rows past the bottom alternate between the last two rows.
+        assert_eq!(tile[2 * TILE], 0);
+        assert_eq!(tile[3 * TILE], 10);
+    }
 
     #[test]
     fn quicktime_dates() {

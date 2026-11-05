@@ -11,6 +11,8 @@
 //!   current directory).
 //! - `--linear`: store linear sensor values instead of the code values and
 //!   their `LinearizationTable`.
+//! - `--uncompressed`: store the samples uncompressed instead of as lossless
+//!   JPEG tiles.
 //! - `--frames FIRST[-[LAST]]`: convert only these frames (0-based,
 //!   inclusive).
 //! - `--overwrite`: replace existing DNG files instead of stopping.
@@ -20,6 +22,7 @@
 
 mod colour;
 mod dng;
+mod lj92;
 mod mov;
 mod tiff;
 
@@ -31,8 +34,8 @@ use std::process::ExitCode;
 use anyhow::{Context, Result, bail, ensure};
 use proresraw_rs::{FrameHeader, decode_frame, is_prores_raw_fourcc, parse_frame};
 
-const USAGE: &str =
-    "usage: prr2dng [-o DIR] [--linear] [--frames FIRST[-[LAST]]] [--overwrite] CLIP.mov...";
+const USAGE: &str = "usage: prr2dng [-o DIR] [--linear] [--uncompressed] [--frames FIRST[-[LAST]]] [--overwrite] \
+     CLIP.mov...";
 
 fn main() -> ExitCode {
     match run() {
@@ -48,6 +51,7 @@ struct Options {
     clips: Vec<PathBuf>,
     output: PathBuf,
     samples: dng::Samples,
+    compression: dng::Compression,
     /// First frame and, if given, last frame (inclusive).
     frames: (usize, Option<usize>),
     overwrite: bool,
@@ -58,6 +62,7 @@ fn parse_args() -> Result<Options> {
         clips: Vec::new(),
         output: PathBuf::from("."),
         samples: dng::Samples::CodeValues,
+        compression: dng::Compression::LosslessJpeg,
         frames: (0, None),
         overwrite: false,
     };
@@ -68,6 +73,7 @@ fn parse_args() -> Result<Options> {
                 options.output = args.next().context("--output needs a folder")?.into();
             }
             Some("--linear") => options.samples = dng::Samples::Linear,
+            Some("--uncompressed") => options.compression = dng::Compression::None,
             Some("--overwrite") => options.overwrite = true,
             Some("--frames") => {
                 let range = args.next().context("--frames needs a range")?;
@@ -235,7 +241,7 @@ impl Clip {
                     frame.skipped_tiles.len()
                 );
             }
-            let data = dng::write(&frame, &self.info, options.samples);
+            let data = dng::write(&frame, &self.info, options.samples, options.compression);
             write_file(&self.output(options, index), &data)?;
             eprint!("\r  frame {}/{}", index + 1 - frames.start, frames.len());
         }

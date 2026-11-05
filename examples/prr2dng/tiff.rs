@@ -1,5 +1,5 @@
 //! A minimal little-endian TIFF writer: one image file directory (IFD) and
-//! its image data, as strips. Enough for a DNG whose raw image is
+//! its image data, as strips or tiles. Enough for a DNG whose raw image is
 //! the main image.
 
 use std::collections::BTreeMap;
@@ -101,15 +101,21 @@ impl Value {
 pub enum Layout {
     /// Strips of `rows` rows each.
     Strips { rows: u32 },
+    /// Tiles of `width` × `height` sensels, row by row.
+    Tiles { width: u32, height: u32 },
 }
 
-/// Tags of the strip layout, which [`write`] fills in.
+/// Tags of the strip or tile layout, which [`write`] fills in.
 const STRIP_OFFSETS: u16 = 273;
 const ROWS_PER_STRIP: u16 = 278;
 const STRIP_BYTE_COUNTS: u16 = 279;
+const TILE_WIDTH: u16 = 322;
+const TILE_LENGTH: u16 = 323;
+const TILE_OFFSETS: u16 = 324;
+const TILE_BYTE_COUNTS: u16 = 325;
 
-/// A TIFF file with one IFD holding `tags` and the image `chunks` (strips,
-/// in order) laid out as `layout` says. The layout tags are
+/// A TIFF file with one IFD holding `tags` and the image `chunks` (strips
+/// or tiles, in order) laid out as `layout` says. The layout tags are
 /// added here.
 pub fn write(mut tags: BTreeMap<u16, Value>, layout: Layout, chunks: &[Vec<u8>]) -> Vec<u8> {
     let sizes = chunks.iter().map(|c| c.len() as u32).collect::<Vec<_>>();
@@ -117,6 +123,11 @@ pub fn write(mut tags: BTreeMap<u16, Value>, layout: Layout, chunks: &[Vec<u8>])
         Layout::Strips { rows } => {
             tags.insert(ROWS_PER_STRIP, Value::Long(vec![rows]));
             (STRIP_OFFSETS, STRIP_BYTE_COUNTS)
+        }
+        Layout::Tiles { width, height } => {
+            tags.insert(TILE_WIDTH, Value::Long(vec![width]));
+            tags.insert(TILE_LENGTH, Value::Long(vec![height]));
+            (TILE_OFFSETS, TILE_BYTE_COUNTS)
         }
     };
     tags.insert(counts_tag, Value::Long(sizes));
@@ -237,6 +248,22 @@ mod tests {
             assert_eq!(offset % 2, 0);
             assert_eq!(data[offset..offset + count], chunks[i]);
         }
+    }
+
+    #[test]
+    fn a_single_tile_offset_fits_in_its_entry() {
+        let data = write(
+            BTreeMap::new(),
+            Layout::Tiles {
+                width: 16,
+                height: 16,
+            },
+            &[vec![9; 5]],
+        );
+        let entries = entries(&data);
+        let offset = entries.iter().find(|e| e.0 == 324).unwrap().3 as usize;
+        assert_eq!(data[offset..offset + 5], [9; 5]);
+        assert_eq!(data.len(), offset + 6, "padded to an even length");
     }
 
     #[test]
