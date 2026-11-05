@@ -43,7 +43,9 @@ pub mod tile;
 
 pub use curve::Curve;
 pub use decoder::{Frame, ParsedFrame, decode_frame, decode_frame_with, parse_frame};
-pub use demosaic::{DemosaicParams, Exposure, frame_quantizer};
+pub use demosaic::{
+    DemosaicParams, Exposure, RgbImage, Stage, develop, develop_with, frame_quantizer,
+};
 pub use error::{Error, Result};
 #[cfg(feature = "gpu")]
 pub use gpu::{GpuDecoder, GpuError, GpuFrame};

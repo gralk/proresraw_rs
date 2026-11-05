@@ -30,7 +30,7 @@
 //! round divisions and square roots, so no single bit pattern is
 //! canonical.
 
-use crate::decoder::ParsedFrame;
+use crate::decoder::{Frame, ParsedFrame};
 use crate::header::{BLACK_LEVEL, FrameHeader};
 
 /// XYZ (D65) to Rec.2020 primaries.
@@ -102,6 +102,22 @@ impl DemosaicParams {
     }
 }
 
+/// How far [`develop`] takes the conversion. Stages run in order, each
+/// including the ones before it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Stage {
+    /// Demosaiced camera RGB without white balance. Every channel clips
+    /// at sensor white (1.0).
+    Demosaiced,
+    /// Camera RGB with the white balance gains applied. Red and blue clip
+    /// where their gain takes them to 1.0, so all channels clip together.
+    #[default]
+    WhiteBalanced,
+    /// Scene-linear Rec.2020 through [`output_matrix`] with
+    /// [`Exposure::Normalized`], Apple's default output.
+    Rec2020,
+}
+
 /// Exposure scaling of [`output_matrix`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum Exposure {
@@ -131,6 +147,108 @@ pub fn output_matrix(header: &FrameHeader, exposure: Exposure) -> [f32; 9] {
         (v * gain) as f32
     })
 }
+
+/// An RGB image of `f32` values.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RgbImage {
+    /// Width in pixels.
+    pub width: usize,
+    /// Height in pixels.
+    pub height: usize,
+    /// Interleaved R, G, B, row-major, tightly packed.
+    pub data: Vec<f32>,
+}
+
+/// Run Apple's raw conversion on a decoded frame up to `stage`, with the
+/// header's white balance and gain. The quantizer for the noise model
+/// comes from [`frame_quantizer`].
+///
+/// ```no_run
+/// # let packet = std::fs::read("frame.bin").unwrap();
+/// use proresraw_rs::{Stage, decode_frame, develop, frame_quantizer, parse_frame};
+/// let frame = decode_frame(&packet).unwrap();
+/// let q = frame_quantizer(&parse_frame(&packet).unwrap());
+/// let camera = develop(&frame, q, Stage::Demosaiced); // no white balance
+/// ```
+pub fn develop(frame: &Frame, quantizer: u32, stage: Stage) -> RgbImage {
+    develop_with(frame, &DemosaicParams::new(&frame.header, quantizer), stage)
+}
+
+/// Like [`develop`] with explicit parameters, for example white balance
+/// gains of your own ([`DemosaicParams::with_white_balance`]). At
+/// [`Stage::Demosaiced`] the gains in `params` are ignored.
+pub fn develop_with(frame: &Frame, params: &DemosaicParams, stage: Stage) -> RgbImage {
+    let mut p = *params;
+    if stage == Stage::Demosaiced {
+        p.wb = [1.0; 2];
+        p.clip = [1.0; 2];
+    }
+    let matrix =
+        (stage == Stage::Rec2020).then(|| output_matrix(&frame.header, Exposure::Normalized));
+    let (w, h) = (frame.width(), frame.height());
+    // Linearization and normalization folded into one table.
+    let lut: Vec<f32> = frame
+        .header
+        .curve
+        .lut()
+        .iter()
+        .map(|&v| p.one_over_range * (i32::from(v) - p.black) as f32)
+        .collect();
+    let mut data = vec![0f32; 3 * w * h];
+    // Bands of rows run every pass while their data is in cache. A band
+    // needs green one row beyond it and normalized values three rows
+    // beyond, recomputed at the seams.
+    let band = |(index, out): (usize, &mut [f32]), scratch: &mut (Vec<f32>, Vec<[f32; 2]>)| {
+        let y0 = index * BAND;
+        let y1 = (y0 + BAND).min(h);
+        let (g0, g1) = (y0.saturating_sub(1), (y1 + 1).min(h));
+        let (n0, n1) = (g0.saturating_sub(2), (g1 + 2).min(h));
+        let (norm, green) = scratch;
+        norm.clear();
+        for y in n0..n1 {
+            norm.extend(frame.row(y).iter().map(|&code| lut[usize::from(code)]));
+        }
+        green.clear();
+        green.resize((g1 - g0) * w, [0.0; 2]);
+        for (y, row) in (g0..g1).zip(green.chunks_exact_mut(w)) {
+            let src = |dy: isize| {
+                let yy = (y as isize + dy).clamp(0, h as isize - 1) as usize - n0;
+                &norm[yy * w..yy * w + w]
+            };
+            green_row([src(-2), src(-1), src(0), src(1), src(2)], y, h, &p, row);
+        }
+        for (y, row) in (y0..y1).zip(out.chunks_exact_mut(3 * w)) {
+            let (ym, yp) = mirrored(y, h);
+            let g = |yy: usize| &green[(yy - g0) * w..(yy - g0) * w + w];
+            chroma_row([g(ym), g(y), g(yp)], y, &p, row);
+        }
+        if let Some(m) = &matrix {
+            matrix_rows(out, m);
+        }
+    };
+    #[cfg(feature = "parallel")]
+    {
+        use rayon::prelude::*;
+        data.par_chunks_mut(3 * w * BAND)
+            .enumerate()
+            .for_each_init(Default::default, |scratch, item| band(item, scratch));
+    }
+    #[cfg(not(feature = "parallel"))]
+    {
+        let mut scratch = Default::default();
+        for item in data.chunks_mut(3 * w * BAND).enumerate() {
+            band(item, &mut scratch);
+        }
+    }
+    RgbImage {
+        width: w,
+        height: h,
+        data,
+    }
+}
+
+/// Rows per band in [`develop_with`].
+const BAND: usize = 32;
 
 /// The rows above and below `y`, mirrored at the picture edges.
 #[inline(always)]
@@ -543,5 +661,49 @@ mod tests {
         let parsed = crate::parse_frame(&packet).unwrap();
         assert_eq!(frame_quantizer(&parsed), 3 * 255);
         assert_eq!(crate::decode_frame(&packet).unwrap().skipped_tiles, [0]);
+    }
+
+    /// Each stage builds on the previous one. `Demosaiced` has no white
+    /// balance: red and blue are neither scaled nor clipped early.
+    #[test]
+    fn develop_stages() {
+        let mut rng = crate::synth::Rng::new(9);
+        let spec = crate::synth::Spec {
+            valid_tiles: true,
+            wb: (2.0, 1.5),
+            ..crate::synth::Spec::new(48, 32, BayerPattern::Rggb)
+        };
+        let packet = crate::synth::random_frame(&spec, &mut rng);
+        let frame = crate::decode_frame(&packet).unwrap();
+        let q = frame_quantizer(&crate::parse_frame(&packet).unwrap());
+        let img = develop(&frame, q, Stage::Demosaiced);
+        let plain = DemosaicParams::with_white_balance(&frame.header, q, 1.0, 1.0);
+        let (w, h) = (frame.width(), frame.height());
+        let demosaiced = chroma_pass(&green_pass(&frame.linearize(), w, h, &plain), w, h, &plain);
+        assert_eq!(img.data, demosaiced);
+        let balanced = develop(&frame, q, Stage::WhiteBalanced).data;
+        assert_ne!(img.data, balanced);
+        let rec2020 = develop(&frame, q, Stage::Rec2020).data;
+        let m = output_matrix(&frame.header, Exposure::Normalized);
+        assert_eq!(rec2020, apply_matrix(&balanced, &m));
+    }
+
+    #[test]
+    fn develop_runs_on_a_decoded_frame() {
+        let mut rng = crate::synth::Rng::new(5);
+        let spec = crate::synth::Spec {
+            valid_tiles: true,
+            ..crate::synth::Spec::new(48, 32, BayerPattern::Bggr)
+        };
+        let packet = crate::synth::random_frame(&spec, &mut rng);
+        let frame = crate::decode_frame(&packet).unwrap();
+        let q = frame_quantizer(&crate::parse_frame(&packet).unwrap());
+        assert!(q > 0);
+        let img = develop(&frame, q, Stage::default());
+        assert_eq!(
+            (img.width, img.height, img.data.len()),
+            (48, 32, 48 * 32 * 3)
+        );
+        assert!(img.data.iter().all(|v| v.is_finite() && *v <= 1.0));
     }
 }

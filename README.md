@@ -53,6 +53,39 @@ are Apple-compatible bit for bit; half resolution equals the full decode
 sampled at the red, first green and blue sensels. On a 4K frame, half,
 quarter and eighth take about 16, 7 and 4 ms.
 
+## Raw conversion
+
+`develop(&frame, frame_quantizer(&parsed), stage)` runs Apple's standard
+raw conversion and returns `f32` RGB. `stage` says how far to go; each
+stage includes the ones before it:
+
+| `Stage` | output |
+|---|---|
+| `Demosaiced` | camera RGB from the noise-aware demosaic, whose noise model follows the frame's quantizer; no white balance, clipped at sensor white |
+| `WhiteBalanced` (default) | the header's white balance applied; red and blue clip where their gains reach 1.0, so all channels clip together |
+| `Rec2020` | scene-linear Rec.2020 through Apple's output matrix (camera to XYZ from the header, XYZ to Rec.2020, header gain × 10/9) |
+
+Stop before `Rec2020` to do your own colour management.
+`develop_with(&frame, &params, stage)` takes explicit `DemosaicParams`,
+for example your own white balance gains. The passes are also public
+(`demosaic::green_pass`, `chroma_pass`, `apply_matrix`, with
+`output_matrix(&header, Exposure::Reflection)` for Apple's other exposure
+scaling).
+
+The quantizer (first quantization matrix entry times the largest tile
+qscale, invalid tiles included) equals the value Apple's decoder computes
+on every sample clip. Compared with GPU runs of Apple's conversion on 4K
+frames, the matrix pass is bit-exact on the same input and the demosaic
+passes agree to within 2·10⁻⁷ on a 0–1 scale. The remaining differences
+come from GPU division rounding, which varies between GPUs. Log and HLG
+output curves are not implemented.
+
+`develop` processes bands of rows so that every pass runs in cache. It
+takes about 50 ms for a 4K frame on 32 threads when built with FMA
+instructions (`-C target-cpu=x86-64-v3` or `native`), and about twice
+that on the baseline x86-64 target, where each fused multiply-add is a
+library call. Results are identical either way.
+
 ## GPU decoding
 
 With the `gpu` feature, `GpuDecoder` decodes on a wgpu device the

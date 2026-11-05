@@ -3,10 +3,11 @@
 //! write it as a 16-bit binary PGM.
 //!
 //! Usage: `decode FRAMES.bin OUT.pgm [--frame N] [--linear] [--gpu]
-//! [--scale half|quarter|eighth]`
+//! [--scale half|quarter|eighth] [--develop STAGE]`
 //!
 //! `--scale` decodes at reduced resolution and writes a 16-bit binary PPM
-//! of linear RGB instead.
+//! of linear RGB instead. `--develop STAGE` runs the raw conversion up to
+//! `demosaiced`, `white-balanced` or `rec2020` and writes a float PFM.
 //!
 //! `--gpu` (feature `gpu`) decodes on the default wgpu adapter and reports
 //! the steady-state time per frame over repeated decodes.
@@ -33,11 +34,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut linear = false;
     let mut gpu = false;
     let mut scale = None;
+    let mut develop = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--frame" => frame_index = args.next().ok_or("--frame needs a number")?.parse()?,
             "--linear" => linear = true,
             "--gpu" => gpu = true,
+            "--develop" => {
+                develop = Some(match args.next().as_deref() {
+                    Some("demosaiced") => proresraw_rs::Stage::Demosaiced,
+                    Some("white-balanced") => proresraw_rs::Stage::WhiteBalanced,
+                    Some("rec2020") => proresraw_rs::Stage::Rec2020,
+                    _ => return Err("--develop needs demosaiced, white-balanced or rec2020".into()),
+                })
+            }
             "--scale" => {
                 scale = Some(match args.next().as_deref() {
                     Some("half") => Scale::Half,
@@ -74,6 +84,22 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("decoded in {:.1} ms", start.elapsed().as_secs_f64() * 1e3);
         frame
     };
+    if let Some(stage) = develop {
+        let start = std::time::Instant::now();
+        let q = proresraw_rs::frame_quantizer(&parsed);
+        let rgb = proresraw_rs::develop(&frame, q, stage);
+        eprintln!(
+            "developed in {:.1} ms (quantizer {q})",
+            start.elapsed().as_secs_f64() * 1e3
+        );
+        // PFM stores rows bottom to top.
+        let mut pfm = format!("PF\n{} {}\n-1.0\n", rgb.width, rgb.height).into_bytes();
+        for row in rgb.data.chunks_exact(3 * rgb.width).rev() {
+            pfm.extend(row.iter().flat_map(|v| v.to_le_bytes()));
+        }
+        std::fs::write(&output, pfm)?;
+        return Ok(());
+    }
     let samples: Vec<u16> = if linear {
         frame.linearize()
     } else {
