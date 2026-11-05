@@ -6,7 +6,7 @@
 use crate::bits::BitReader;
 use crate::codebook::{
     AC_CB, AC_INITIAL, Codebook, DC_CB, DC_RESET, FIRST_DC, LN_CB, LN_INITIAL, RN_CB, RN_INITIAL,
-    SCAN,
+    SCAN, SCAN_2X2, SCAN_4X4,
 };
 
 /// Largest number of blocks a component stream can hold (alignment 4).
@@ -23,8 +23,33 @@ fn next(table: &[Codebook], symbol: u32) -> Codebook {
 /// `align` is the stream's offset from a 4-byte boundary (see
 /// [`BitReader::new`]).
 pub fn decode_component(data: &[u8], align: usize, log2_blocks: u8, coefs: &mut [i16]) {
+    decode_component_reduced(data, align, log2_blocks, 6, coefs);
+}
+
+/// Decode only the leading `1 << log2_coefs` scan positions of every block
+/// (64, 16 or 4: the full 8×8 block or its top-left 4×4 or 2×2 corner) and
+/// stop there, ignoring the rest of the stream. `coefs` holds
+/// `1 << (log2_coefs + log2_blocks)` coefficients, each block in raster
+/// order over its corner (row stride 8, 4 or 2).
+///
+/// # Panics
+/// If `log2_coefs` is not 6, 4 or 2.
+pub fn decode_component_reduced(
+    data: &[u8],
+    align: usize,
+    log2_blocks: u8,
+    log2_coefs: u8,
+    coefs: &mut [i16],
+) {
+    let scan: &[u8] = match log2_coefs {
+        6 => &SCAN,
+        4 => &SCAN_4X4,
+        2 => &SCAN_2X2,
+        _ => panic!("unsupported coefficient count 1 << {log2_coefs}"),
+    };
+    let per_block = 1u32 << log2_coefs;
     let blocks = 1u32 << log2_blocks;
-    let codes = 64 * blocks;
+    let codes = per_block * blocks;
     let block_mask = blocks - 1;
     debug_assert_eq!(coefs.len(), codes as usize);
     coefs.fill(0);
@@ -53,13 +78,14 @@ pub fn decode_component(data: &[u8], align: usize, log2_blocks: u8, coefs: &mut 
         sign = u32::from(delta < 0);
         r.consume(len);
         dc = dc.wrapping_add(delta);
-        coefs[64 * block as usize] = dc as i16;
+        coefs[(per_block * block) as usize] = dc as i16;
     }
 
     // AC: runs of non-zero levels alternating with runs of zeros, in
     // frequency-major order across the blocks.
-    let place =
-        |n: u32| usize::from(SCAN[(n >> log2_blocks) as usize]) + ((n & block_mask) << 6) as usize;
+    let place = |n: u32| {
+        usize::from(scan[(n >> log2_blocks) as usize]) + ((n & block_mask) << log2_coefs) as usize
+    };
     // Level symbol, sign and 32-bit view to the stored coefficient.
     let level = |r: &mut BitReader<'_>, cb: Codebook| {
         let top = r.top();

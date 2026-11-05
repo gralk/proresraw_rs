@@ -101,6 +101,14 @@ pub const SCAN: [u8; 64] = [
     31, 38, 45, 52, 60, 53, 46, 39, 47, 54, 61, 62, 55, 63,
 ];
 
+/// The first 16 entries of [`SCAN`], which cover the top-left 4×4 corner,
+/// as positions within a 4×4 block (reduced-resolution decoding).
+pub const SCAN_4X4: [u8; 16] = [0, 4, 1, 5, 8, 12, 9, 13, 2, 6, 3, 7, 10, 14, 11, 15];
+
+/// The first 4 entries of [`SCAN`], the top-left 2×2 corner, as positions
+/// within a 2×2 block.
+pub const SCAN_2X2: [u8; 4] = [0, 2, 1, 3];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -144,6 +152,15 @@ mod tests {
         for &i in &SCAN {
             assert!(!seen[usize::from(i)]);
             seen[usize::from(i)] = true;
+        }
+        // The reduced scans are the full scan's leading corners.
+        for (n, &p) in SCAN_4X4.iter().enumerate() {
+            let full = SCAN[n];
+            assert_eq!(p, full / 8 * 4 + full % 8);
+        }
+        for (n, &p) in SCAN_2X2.iter().enumerate() {
+            let full = SCAN[n];
+            assert_eq!(p, full / 8 * 2 + full % 8);
         }
     }
 }
