@@ -24,6 +24,10 @@
 //! let linear = frame.linearize();
 //! ```
 
+// The only unsafe code is the run-time FMA dispatch of the raw conversion
+// (feature `runtime-fma`); without it, unsafe code is forbidden outright.
+#![cfg_attr(not(feature = "runtime-fma"), forbid(unsafe_code))]
+
 pub mod bits;
 pub mod codebook;
 pub mod coefficients;

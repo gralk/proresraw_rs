@@ -81,10 +81,13 @@ come from GPU division rounding, which varies between GPUs. Log and HLG
 output curves are not implemented.
 
 `develop` processes bands of rows so that every pass runs in cache. It
-takes about 50 ms for a 4K frame on 32 threads when built with FMA
-instructions (`-C target-cpu=x86-64-v3` or `native`), and about twice
-that on the baseline x86-64 target, where each fused multiply-add is a
-library call. Results are identical either way.
+takes about 50 ms for a 4K frame on 32 threads. On x86-64 the default
+feature `runtime-fma` runs the conversion kernels with AVX2 and FMA
+instructions when the CPU has them, through one small `unsafe` dispatch;
+without the feature the crate forbids unsafe code, and the conversion
+falls back to a library call per fused multiply-add, about half the
+speed unless the build targets FMA itself (`-C target-cpu=x86-64-v3` or
+`native`). Results are bit-identical on every path.
 
 ## GPU decoding
 

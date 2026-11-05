@@ -326,7 +326,8 @@ fn green_pass_normalized(norm: &[f32], w: usize, h: usize, p: &DemosaicParams) -
 
 /// One row `y` of the green pass. `rows` are the normalized rows `y - 2`
 /// to `y + 2`, clamped to the picture of height `h`.
-fn green_row(rows: [&[f32]; 5], y: usize, h: usize, p: &DemosaicParams, out: &mut [[f32; 2]]) {
+#[inline(always)]
+fn green_row_impl(rows: [&[f32]; 5], y: usize, h: usize, p: &DemosaicParams, out: &mut [[f32; 2]]) {
     let w = out.len();
     let bs = p.black as f32 * p.one_over_range;
     let var = |v: f32| variance(v, bs, p.noise);
@@ -466,7 +467,8 @@ pub fn chroma_pass(green: &[[f32; 2]], w: usize, h: usize, p: &DemosaicParams) -
 
 /// One row `y` of the chroma pass from the green-pass rows above, at and
 /// below it (mirrored at the picture edges), into interleaved RGB.
-fn chroma_row(rows: [&[[f32; 2]]; 3], y: usize, p: &DemosaicParams, out: &mut [f32]) {
+#[inline(always)]
+fn chroma_row_impl(rows: [&[[f32; 2]]; 3], y: usize, p: &DemosaicParams, out: &mut [f32]) {
     let [up, mid, down] = rows;
     let w = mid.len();
     let off = p.black_over_range;
@@ -511,13 +513,66 @@ pub fn apply_matrix(rgb: &[f32], m: &[f32; 9]) -> Vec<f32> {
 }
 
 /// [`apply_matrix`] in place.
-fn matrix_rows(rgb: &mut [f32], m: &[f32; 9]) {
+#[inline(always)]
+fn matrix_rows_impl(rgb: &mut [f32], m: &[f32; 9]) {
     for px in rgb.chunks_exact_mut(3) {
         let [r, g, b] = [px[0], px[1], px[2]];
         for (v, i) in px.iter_mut().zip([0, 3, 6]) {
             *v = fma(b, m[i + 2], fma(r, m[i], g * m[i + 1]));
         }
     }
+}
+
+/// Row kernels, dispatched at run time to copies compiled with AVX2 and
+/// FMA when the CPU has them (feature `runtime-fma`). Both copies come
+/// from the same source and give identical results: `mul_add` is a fused
+/// multiply-add either way, one instruction in the fast copy and a library
+/// call otherwise.
+macro_rules! dispatch {
+    ($(fn $name:ident => $imp:ident ($($arg:ident: $ty:ty),*);)*) => {$(
+        #[inline]
+        fn $name($($arg: $ty),*) {
+            #[cfg(all(feature = "runtime-fma", target_arch = "x86_64", not(target_feature = "fma")))]
+            if fast::available() {
+                #[allow(unsafe_code)]
+                // SAFETY: `available` checked that the CPU supports every
+                // feature `fast::$name` is compiled with.
+                return unsafe { fast::$name($($arg),*) };
+            }
+            $imp($($arg),*)
+        }
+    )*
+        #[cfg(all(feature = "runtime-fma", target_arch = "x86_64", not(target_feature = "fma")))]
+        #[allow(unsafe_code)]
+        mod fast {
+            use super::*;
+
+            /// Whether the CPU has AVX2 and FMA (cached by the standard
+            /// library).
+            #[inline]
+            pub(super) fn available() -> bool {
+                std::arch::is_x86_feature_detected!("avx2")
+                    && std::arch::is_x86_feature_detected!("fma")
+            }
+
+            $(
+                #[target_feature(enable = "avx2,fma")]
+                pub(super) unsafe fn $name($($arg: $ty),*) {
+                    $imp($($arg),*)
+                }
+            )*
+        }
+    };
+}
+
+dispatch! {
+    fn green_row => green_row_impl(
+        rows: [&[f32]; 5], y: usize, h: usize, p: &DemosaicParams, out: &mut [[f32; 2]]
+    );
+    fn chroma_row => chroma_row_impl(
+        rows: [&[[f32; 2]]; 3], y: usize, p: &DemosaicParams, out: &mut [f32]
+    );
+    fn matrix_rows => matrix_rows_impl(rgb: &mut [f32], m: &[f32; 9]);
 }
 
 #[cfg(test)]

@@ -11,9 +11,16 @@ categories = ["multimedia::encoding", "multimedia::video"]
 publish = false
 
 [features]
-default = ["parallel"]
+default = ["parallel", "runtime-fma"]
 # Decode tile rows on a rayon thread pool.
 parallel = ["dep:rayon"]
+# On x86-64, run the raw-conversion kernels with AVX2 and FMA
+# instructions when the CPU has them, detected at run time; results are
+# identical either way. This is the crate's only unsafe code: without
+# the feature the crate forbids unsafe code. Not needed when the build
+# already targets FMA (for example `-C target-cpu=x86-64-v3`) or on
+# other architectures.
+runtime-fma = []
 # Decode on a GPU through wgpu, with a device the caller provides.
 gpu = ["dep:wgpu"]
 # Dev only: expose the IDCT test-block generator and the synthetic frame
@@ -30,7 +37,7 @@ pollster = "0.4"
 wgpu = { version = "27", default-features = false, features = ["std", "wgsl", "vulkan", "metal", "dx12"] }
 
 [lints.rust]
-unsafe_code = "forbid"
+unsafe_code = "deny"
 missing_docs = "warn"
 
 [lints.clippy]
