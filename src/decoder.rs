@@ -151,13 +151,41 @@ impl Frame {
     }
 
     /// Linear sensor values of the visible picture, tightly packed.
+    ///
+    /// To fuse linearization into a pass of your own instead, index the
+    /// curve's table ([`crate::Curve::lut`]) with the code values of
+    /// [`Frame::row`].
     pub fn linearize(&self) -> Vec<u16> {
-        let lut = self.header.curve.lut();
-        let mut out = Vec::with_capacity(self.width() * self.height());
-        for row in self.rows() {
-            out.extend(row.iter().map(|&c| lut[usize::from(c)]));
-        }
+        let mut out = vec![0; self.width() * self.height()];
+        self.linearize_into(&mut out);
         out
+    }
+
+    /// [`Frame::linearize`] into a caller-owned buffer of
+    /// `width * height` values, for reusing it from frame to frame.
+    ///
+    /// # Panics
+    ///
+    /// If `out` does not hold exactly `width * height` values.
+    pub fn linearize_into(&self, out: &mut [u16]) {
+        let w = self.width();
+        assert_eq!(out.len(), w * self.height(), "output size");
+        if w == 0 {
+            return;
+        }
+        let lut = self.header.curve.lut();
+        let row = |(y, dst): (usize, &mut [u16])| {
+            for (d, &c) in dst.iter_mut().zip(self.row(y)) {
+                *d = lut[usize::from(c)];
+            }
+        };
+        #[cfg(feature = "parallel")]
+        {
+            use rayon::prelude::*;
+            out.par_chunks_exact_mut(w).enumerate().for_each(row);
+        }
+        #[cfg(not(feature = "parallel"))]
+        out.chunks_exact_mut(w).enumerate().for_each(row);
     }
 }
 
@@ -300,6 +328,9 @@ mod tests {
         assert!(frame.skipped_tiles.is_empty());
         assert!(frame.samples.iter().all(|&v| v == 32768));
         assert!(frame.linearize().iter().all(|&v| v == 4096));
+        let mut reused = vec![0; 16 * 16];
+        frame.linearize_into(&mut reused);
+        assert_eq!(reused, frame.linearize());
 
         // Empty streams make the tile invalid: it is skipped.
         let at = p.len() - 12;
