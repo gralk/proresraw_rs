@@ -626,33 +626,74 @@ fn read_buffer(
     src: &wgpu::Buffer,
     size: u64,
 ) -> Result<Vec<u8>, GpuError> {
-    let staging = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("prores raw readback"),
-        size,
-        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
+    let [bytes] = read_buffers(device, queue, &[src], size)?;
+    Ok(bytes)
+}
+
+/// Copy the first `size` bytes of each of `srcs` to the host, with one
+/// submission and one wait.
+fn read_buffers<const N: usize>(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    srcs: &[&wgpu::Buffer; N],
+    size: u64,
+) -> Result<[Vec<u8>; N], GpuError> {
+    let mut out: [Vec<u8>; N] = std::array::from_fn(|_| Vec::new());
+    read_buffers_with(device, queue, srcs, size, |i, bytes| {
+        out[i] = bytes.to_vec()
+    })?;
+    Ok(out)
+}
+
+/// Like [`read_buffers`], handing each buffer's mapped bytes to `f` with
+/// its index instead of copying them.
+fn read_buffers_with<const N: usize>(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    srcs: &[&wgpu::Buffer; N],
+    size: u64,
+    mut f: impl FnMut(usize, &[u8]),
+) -> Result<(), GpuError> {
+    let staging = srcs.map(|_| {
+        device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("prores raw readback"),
+            size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        })
     });
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("prores raw readback"),
     });
-    encoder.copy_buffer_to_buffer(src, 0, &staging, 0, size);
+    for (src, dst) in srcs.iter().zip(&staging) {
+        encoder.copy_buffer_to_buffer(src, 0, dst, 0, size);
+    }
     queue.submit([encoder.finish()]);
-    let slice = staging.slice(..);
     let (tx, rx) = std::sync::mpsc::channel();
-    slice.map_async(wgpu::MapMode::Read, move |result| {
-        let _ = tx.send(result);
-    });
+    for buffer in &staging {
+        let tx = tx.clone();
+        buffer
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |result| {
+                let _ = tx.send(result);
+            });
+    }
+    drop(tx);
     device
         .poll(wgpu::PollType::wait_indefinitely())
         .map_err(GpuError::Poll)?;
-    // wgpu runs the callback before a waiting poll returns; a dropped
-    // sender means the mapping never completed.
-    rx.recv()
-        .map_err(|_| GpuError::Map(wgpu::BufferAsyncError))?
-        .map_err(GpuError::Map)?;
-    let bytes = slice.get_mapped_range().to_vec();
-    staging.unmap();
-    Ok(bytes)
+    // wgpu runs the callbacks before a waiting poll returns; a dropped
+    // sender means a mapping never completed.
+    for _ in 0..N {
+        rx.recv()
+            .map_err(|_| GpuError::Map(wgpu::BufferAsyncError))?
+            .map_err(GpuError::Map)?;
+    }
+    for (i, buffer) in staging.iter().enumerate() {
+        f(i, &buffer.slice(..).get_mapped_range());
+        buffer.unmap();
+    }
+    Ok(())
 }
 
 #[cfg(test)]
