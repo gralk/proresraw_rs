@@ -182,27 +182,89 @@ pub fn develop(frame: &Frame, stage: Stage) -> RgbImage {
 /// gains of your own ([`DemosaicParams::with_white_balance`]). At
 /// [`Stage::Demosaiced`] the gains in `params` are ignored.
 pub fn develop_with(frame: &Frame, params: &DemosaicParams, stage: Stage) -> RgbImage {
-    let mut p = *params;
-    if stage == Stage::Demosaiced {
-        p.wb = [1.0; 2];
-        p.clip = [1.0; 2];
+    let (width, height) = (frame.width(), frame.height());
+    let mut data = vec![0f32; 3 * width * height];
+    develop_into(frame, params, stage, &mut data);
+    RgbImage {
+        width,
+        height,
+        data,
     }
-    let matrix =
-        (stage == Stage::Rec2020).then(|| output_matrix(&frame.header, Exposure::Normalized));
+}
+
+/// [`develop_with`] into a caller-owned buffer of interleaved RGB, for
+/// reusing one buffer across frames.
+///
+/// # Panics
+///
+/// If `out` does not hold exactly `3 * width * height` values.
+pub fn develop_into(frame: &Frame, params: &DemosaicParams, stage: Stage, out: &mut [f32]) {
     let (w, h) = (frame.width(), frame.height());
-    // Linearization and normalization folded into one table.
-    let lut: Vec<f32> = frame
-        .header
-        .curve
-        .lut()
-        .iter()
-        .map(|&v| p.one_over_range * (i32::from(v) - p.black) as f32)
-        .collect();
-    let mut data = vec![0f32; 3 * w * h];
-    // Bands of rows run every pass while their data is in cache. A band
-    // needs green one row beyond it and normalized values three rows
-    // beyond, recomputed at the seams.
-    let band = |(index, out): (usize, &mut [f32]), scratch: &mut (Vec<f32>, Vec<[f32; 2]>)| {
+    assert_eq!(out.len(), 3 * w * h, "output size");
+    Conversion::new(frame, params, stage).run_interleaved(frame, out);
+}
+
+/// Per-band scratch: normalized rows and green-pass rows.
+type Scratch = (Vec<f32>, Vec<[f32; 2]>);
+
+/// Everything the bands of one conversion share.
+struct Conversion {
+    params: DemosaicParams,
+    matrix: Option<[f32; 9]>,
+    /// Linearization and normalization folded into one table.
+    lut: Vec<f32>,
+}
+
+impl Conversion {
+    fn new(frame: &Frame, params: &DemosaicParams, stage: Stage) -> Self {
+        let mut p = *params;
+        if stage == Stage::Demosaiced {
+            p.wb = [1.0; 2];
+            p.clip = [1.0; 2];
+        }
+        let matrix =
+            (stage == Stage::Rec2020).then(|| output_matrix(&frame.header, Exposure::Normalized));
+        let lut = frame
+            .header
+            .curve
+            .lut()
+            .iter()
+            .map(|&v| p.one_over_range * (i32::from(v) - p.black) as f32)
+            .collect();
+        Conversion {
+            params: p,
+            matrix,
+            lut,
+        }
+    }
+
+    fn run_interleaved(&self, frame: &Frame, out: &mut [f32]) {
+        let chunk = 3 * frame.width() * BAND;
+        let band = |scratch: &mut Scratch, (index, rows): (usize, &mut [f32])| {
+            self.band(frame, index, rows, scratch);
+        };
+        #[cfg(feature = "parallel")]
+        {
+            use rayon::prelude::*;
+            out.par_chunks_mut(chunk)
+                .enumerate()
+                .for_each_init(Scratch::default, band);
+        }
+        #[cfg(not(feature = "parallel"))]
+        {
+            let mut scratch = Scratch::default();
+            out.chunks_mut(chunk)
+                .enumerate()
+                .for_each(|item| band(&mut scratch, item));
+        }
+    }
+
+    /// Run every pass over band `index`, writing its rows to `out`. A band
+    /// needs green one row beyond it and normalized values three rows
+    /// beyond, recomputed at the seams, so that its data stays in cache.
+    fn band(&self, frame: &Frame, index: usize, out: &mut [f32], scratch: &mut Scratch) {
+        let p = &self.params;
+        let (w, h) = (frame.width(), frame.height());
         let y0 = index * BAND;
         let y1 = (y0 + BAND).min(h);
         let (g0, g1) = (y0.saturating_sub(1), (y1 + 1).min(h));
@@ -210,7 +272,7 @@ pub fn develop_with(frame: &Frame, params: &DemosaicParams, stage: Stage) -> Rgb
         let (norm, green) = scratch;
         norm.clear();
         for y in n0..n1 {
-            norm.extend(frame.row(y).iter().map(|&code| lut[usize::from(code)]));
+            norm.extend(frame.row(y).iter().map(|&code| self.lut[usize::from(code)]));
         }
         green.clear();
         green.resize((g1 - g0) * w, [0.0; 2]);
@@ -219,35 +281,17 @@ pub fn develop_with(frame: &Frame, params: &DemosaicParams, stage: Stage) -> Rgb
                 let yy = (y as isize + dy).clamp(0, h as isize - 1) as usize - n0;
                 &norm[yy * w..yy * w + w]
             };
-            green_row([src(-2), src(-1), src(0), src(1), src(2)], y, h, &p, row);
+            green_row([src(-2), src(-1), src(0), src(1), src(2)], y, h, p, row);
         }
-        for (y, row) in (y0..y1).zip(out.chunks_exact_mut(3 * w)) {
+        let g = |yy: usize| &green[(yy - g0) * w..(yy - g0) * w + w];
+        for (i, y) in (y0..y1).enumerate() {
             let (ym, yp) = mirrored(y, h);
-            let g = |yy: usize| &green[(yy - g0) * w..(yy - g0) * w + w];
-            chroma_row([g(ym), g(y), g(yp)], y, &p, row);
+            let rows = [g(ym), g(y), g(yp)];
+            chroma_row(rows, y, p, &mut out[3 * w * i..3 * w * (i + 1)]);
         }
-        if let Some(m) = &matrix {
+        if let Some(m) = &self.matrix {
             matrix_rows(out, m);
         }
-    };
-    #[cfg(feature = "parallel")]
-    {
-        use rayon::prelude::*;
-        data.par_chunks_mut(3 * w * BAND)
-            .enumerate()
-            .for_each_init(Default::default, |scratch, item| band(item, scratch));
-    }
-    #[cfg(not(feature = "parallel"))]
-    {
-        let mut scratch = Default::default();
-        for item in data.chunks_mut(3 * w * BAND).enumerate() {
-            band(item, &mut scratch);
-        }
-    }
-    RgbImage {
-        width: w,
-        height: h,
-        data,
     }
 }
 
@@ -749,6 +793,29 @@ mod tests {
         let rec2020 = develop(&frame, Stage::Rec2020).data;
         let m = output_matrix(&frame.header, Exposure::Normalized);
         assert_eq!(rec2020, apply_matrix(&balanced, &m));
+    }
+
+    /// A caller-owned buffer gets the same values as a fresh image, at
+    /// every stage, including frames whose height is not a whole number
+    /// of bands.
+    #[test]
+    fn develop_into_matches_develop_with() {
+        let mut rng = crate::synth::Rng::new(10);
+        let spec = crate::synth::Spec {
+            valid_tiles: true,
+            wb: (1.8, 1.3),
+            ..crate::synth::Spec::new(80, 80, BayerPattern::Grbg)
+        };
+        let packet = crate::synth::random_frame(&spec, &mut rng);
+        let frame = crate::decode_frame(&packet).unwrap();
+        let params = DemosaicParams::new(&frame.header, frame.quantizer());
+        assert!(frame.height() % BAND != 0);
+        for stage in [Stage::Demosaiced, Stage::WhiteBalanced, Stage::Rec2020] {
+            let image = develop_with(&frame, &params, stage);
+            let mut reused = vec![f32::NAN; image.data.len()];
+            develop_into(&frame, &params, stage, &mut reused);
+            assert_eq!(reused, image.data, "{stage:?}");
+        }
     }
 
     #[test]
