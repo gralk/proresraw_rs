@@ -6,15 +6,17 @@
 //! [--scale half|quarter|eighth [--average-greens]] [--develop STAGE]`
 //!
 //! `--scale` decodes at reduced resolution and writes a 16-bit binary PPM
-//! of linear RGB instead; `--average-greens` reads both green streams. `--develop STAGE` runs the raw conversion up to
-//! `demosaiced`, `white-balanced` or `rec2020` and writes a float PFM.
+//! of linear RGB instead; `--average-greens` reads both green streams.
+//! `--develop STAGE` runs the raw conversion up to `demosaiced`,
+//! `white-balanced` or `rec2020` and writes a float PFM.
 //!
-//! `--gpu` (feature `gpu`) decodes on the default wgpu adapter and reports
-//! the steady-state time per frame over repeated decodes.
+//! `--gpu` (feature `gpu`) decodes, and with `--develop` also converts, on
+//! the default wgpu adapter and reports the steady-state time per frame
+//! over repeated runs.
 
 use std::process::ExitCode;
 
-use proresraw_rs::{Greens, Scale, decode_frame, decode_frame_reduced_with, parse_frame};
+use proresraw_rs::{Greens, RgbImage, Scale, decode_frame, decode_frame_reduced_with, parse_frame};
 
 fn main() -> ExitCode {
     match run() {
@@ -78,22 +80,28 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         std::fs::write(&output, ppm)?;
         return Ok(());
     }
-    let frame = if gpu {
-        decode_on_gpu(packet)?
+    let (frame, gpu_rgb) = if gpu {
+        on_gpu(packet, develop)?
     } else {
         let start = std::time::Instant::now();
         let frame = decode_frame(packet)?;
         eprintln!("decoded in {:.1} ms", start.elapsed().as_secs_f64() * 1e3);
-        frame
+        (frame, None)
     };
     if let Some(stage) = develop {
-        let start = std::time::Instant::now();
-        let rgb = proresraw_rs::develop(&frame, stage);
-        eprintln!(
-            "developed in {:.1} ms (quantizer {})",
-            start.elapsed().as_secs_f64() * 1e3,
-            frame.quantizer()
-        );
+        let rgb = match gpu_rgb {
+            Some(rgb) => rgb,
+            None => {
+                let start = std::time::Instant::now();
+                let rgb = proresraw_rs::develop(&frame, stage);
+                eprintln!(
+                    "developed in {:.1} ms (quantizer {})",
+                    start.elapsed().as_secs_f64() * 1e3,
+                    frame.quantizer()
+                );
+                rgb
+            }
+        };
         // PFM stores rows bottom to top.
         let mut pfm = format!("PF\n{} {}\n-1.0\n", rgb.width, rgb.height).into_bytes();
         for row in rgb.data.chunks_exact(3 * rgb.width).rev() {
@@ -113,8 +121,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// The frame decoded on the GPU, and converted there too when `develop`
+/// names a stage.
+type GpuResult = Result<(proresraw_rs::Frame, Option<RgbImage>), Box<dyn std::error::Error>>;
+
 #[cfg(feature = "gpu")]
-fn decode_on_gpu(packet: &[u8]) -> Result<proresraw_rs::Frame, Box<dyn std::error::Error>> {
+fn on_gpu(packet: &[u8], develop: Option<proresraw_rs::Stage>) -> GpuResult {
     use std::time::Instant;
     let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::from_env_or_default());
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
@@ -135,14 +147,62 @@ fn decode_on_gpu(packet: &[u8]) -> Result<proresraw_rs::Frame, Box<dyn std::erro
     wait(&device)?;
     let per_frame = start.elapsed().as_secs_f64() * 1e3 / f64::from(RUNS);
     eprintln!("GPU decode: {per_frame:.2} ms per frame over {RUNS} frames (upload included)");
+    let rgb = match develop {
+        None => None,
+        Some(stage) => {
+            let mut developer = proresraw_rs::GpuDeveloper::new(&device);
+            let params = proresraw_rs::DemosaicParams::new(&frame.header, frame.quantizer());
+            let rgb = developer.develop(&device, &queue, &frame, &params, stage)?;
+            wait(&device)?;
+            let [r, g, b] = &rgb.planes;
+            let start = Instant::now();
+            for _ in 0..RUNS {
+                developer.develop_into(
+                    &device,
+                    &queue,
+                    &frame.header,
+                    &params,
+                    stage,
+                    &frame.samples,
+                    [r, g, b],
+                )?;
+            }
+            wait(&device)?;
+            let per_frame = start.elapsed().as_secs_f64() * 1e3 / f64::from(RUNS);
+            eprintln!(
+                "GPU develop: {per_frame:.2} ms per frame over {RUNS} frames (quantizer {})",
+                frame.quantizer()
+            );
+            let start = Instant::now();
+            let mut planes = rgb.download(&device, &queue)?;
+            eprintln!(
+                "planes download: {:.1} ms",
+                start.elapsed().as_secs_f64() * 1e3
+            );
+            let [r, g, b] = &mut planes.planes;
+            let start = Instant::now();
+            rgb.download_into(&device, &queue, [r, g, b])?;
+            eprintln!(
+                "planes download into reused planes: {:.1} ms",
+                start.elapsed().as_secs_f64() * 1e3
+            );
+            let [r, g, b] = &planes.planes;
+            let data = (0..r.len()).flat_map(|i| [r[i], g[i], b[i]]).collect();
+            Some(RgbImage {
+                width: planes.width,
+                height: planes.height,
+                data,
+            })
+        }
+    };
     let start = Instant::now();
     let frame = frame.download(&device, &queue)?;
     eprintln!("download: {:.1} ms", start.elapsed().as_secs_f64() * 1e3);
-    Ok(frame)
+    Ok((frame, rgb))
 }
 
 #[cfg(not(feature = "gpu"))]
-fn decode_on_gpu(_: &[u8]) -> Result<proresraw_rs::Frame, Box<dyn std::error::Error>> {
+fn on_gpu(_: &[u8], _: Option<proresraw_rs::Stage>) -> GpuResult {
     Err("built without the gpu feature".into())
 }
 
