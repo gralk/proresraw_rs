@@ -26,6 +26,12 @@ pub struct ParsedFrame<'a> {
     pub max_qscale: u8,
 }
 
+/// The frame quantizer of a header and largest tile qscale: the first
+/// quantization matrix entry times the qscale.
+pub(crate) fn quantizer(header: &FrameHeader, max_qscale: u8) -> u32 {
+    u32::from(header.quant_matrix[0]) * u32::from(max_qscale)
+}
+
 /// Split a packet into its header and tiles without decoding them.
 pub fn parse_frame(packet: &[u8]) -> Result<ParsedFrame<'_>> {
     let prefix = packet.get(..PREFIX_LEN).ok_or(Error::Truncated {
@@ -106,9 +112,18 @@ pub struct Frame {
     /// Such tiles are skipped without writing their sensels, as Apple's
     /// decoder does; here they stay 0. Empty for a well-formed frame.
     pub skipped_tiles: Vec<usize>,
+    /// Largest qscale byte over all tiles, as in
+    /// [`ParsedFrame::max_qscale`].
+    pub max_qscale: u8,
 }
 
 impl Frame {
+    /// The quantizer that drives the demosaic noise model, the same value
+    /// [`crate::demosaic::frame_quantizer`] gives for the parsed packet.
+    pub fn quantizer(&self) -> u32 {
+        quantizer(&self.header, self.max_qscale)
+    }
+
     /// Visible width in sensels.
     pub fn width(&self) -> usize {
         usize::from(self.header.width)
@@ -192,6 +207,7 @@ pub fn decode_frame_with(packet: &[u8], idct: Idct) -> Result<Frame> {
         header,
         samples,
         skipped_tiles: skipped.concat(),
+        max_qscale: parsed.max_qscale,
     })
 }
 

@@ -72,6 +72,9 @@ pub struct RgbFrame {
     /// Indices (frame order) of tiles skipped for an invalid tile header;
     /// their pixels stay 0.
     pub skipped_tiles: Vec<usize>,
+    /// Largest qscale byte over all tiles, as in
+    /// [`ParsedFrame::max_qscale`](crate::ParsedFrame::max_qscale).
+    pub max_qscale: u8,
 }
 
 impl RgbFrame {
@@ -95,6 +98,12 @@ impl RgbFrame {
     pub fn row(&self, y: usize) -> &[u16] {
         let start = 3 * y * self.stride();
         &self.samples[start..start + 3 * self.width()]
+    }
+
+    /// The frame quantizer, as [`Frame::quantizer`](crate::Frame::quantizer)
+    /// gives it for a full decode.
+    pub fn quantizer(&self) -> u32 {
+        crate::decoder::quantizer(&self.header, self.max_qscale)
     }
 
     /// Visible pixels as tightly packed interleaved RGB.
@@ -158,6 +167,7 @@ pub fn decode_frame_reduced(packet: &[u8], scale: Scale) -> Result<RgbFrame> {
         scale,
         samples,
         skipped_tiles: skipped.concat(),
+        max_qscale: parsed.max_qscale,
     })
 }
 

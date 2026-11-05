@@ -44,8 +44,11 @@ pub const XYZ_TO_REC2020: [[f64; 3]; 3] = [
 /// quantization matrix entry times the largest tile qscale of the frame
 /// ([`ParsedFrame::max_qscale`], which counts invalid tiles too, as Apple's
 /// decoder does).
+///
+/// Decoded frames carry the same value ([`Frame::quantizer`]); this form
+/// is for callers that only parse.
 pub fn frame_quantizer(parsed: &ParsedFrame<'_>) -> u32 {
-    u32::from(parsed.header.quant_matrix[0]) * u32::from(parsed.max_qscale)
+    crate::decoder::quantizer(&parsed.header, parsed.max_qscale)
 }
 
 /// Parameters of the green pass and the chroma pass, in `f32` exactly as
@@ -715,7 +718,11 @@ mod tests {
         packet[start + 2..start + 4].fill(0);
         let parsed = crate::parse_frame(&packet).unwrap();
         assert_eq!(frame_quantizer(&parsed), 3 * 255);
-        assert_eq!(crate::decode_frame(&packet).unwrap().skipped_tiles, [0]);
+        let frame = crate::decode_frame(&packet).unwrap();
+        assert_eq!(frame.skipped_tiles, [0]);
+        assert_eq!(frame.quantizer(), 3 * 255);
+        let reduced = crate::decode_frame_reduced(&packet, crate::Scale::Half).unwrap();
+        assert_eq!(reduced.quantizer(), 3 * 255);
     }
 
     /// Each stage builds on the previous one. `Demosaiced` has no white

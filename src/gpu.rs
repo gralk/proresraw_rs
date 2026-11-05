@@ -198,6 +198,7 @@ pub struct GpuDecoder {
     coefs: Slot,
     skipped: Slot,
     skipped_tiles: Vec<usize>,
+    max_qscale: u8,
 }
 
 impl GpuDecoder {
@@ -260,6 +261,7 @@ impl GpuDecoder {
             ),
             skipped: Slot::new("prores raw skipped squares", copy_storage),
             skipped_tiles: Vec::new(),
+            max_qscale: 0,
         }
     }
 
@@ -283,7 +285,14 @@ impl GpuDecoder {
             header,
             samples,
             skipped_tiles: self.skipped_tiles.clone(),
+            max_qscale: self.max_qscale,
         })
+    }
+
+    /// Largest tile qscale byte of the most recently submitted frame (see
+    /// [`Frame::max_qscale`]).
+    pub fn max_qscale(&self) -> u8 {
+        self.max_qscale
     }
 
     /// Indices of the tiles of the most recently submitted frame that were
@@ -336,6 +345,7 @@ impl GpuDecoder {
             pass.dispatch_workgroups(layout.squares_x, layout.squares_y, 1);
         }
         queue.submit([encoder.finish()]);
+        self.max_qscale = parsed.max_qscale;
         Ok(parsed.header)
     }
 
@@ -492,9 +502,16 @@ pub struct GpuFrame {
     pub samples: wgpu::Buffer,
     /// Indices of tiles skipped for an invalid header; their sensels are 0.
     pub skipped_tiles: Vec<usize>,
+    /// Largest qscale byte over all tiles, as in [`Frame::max_qscale`].
+    pub max_qscale: u8,
 }
 
 impl GpuFrame {
+    /// The frame quantizer, as [`Frame::quantizer`] gives it.
+    pub fn quantizer(&self) -> u32 {
+        crate::decoder::quantizer(&self.header, self.max_qscale)
+    }
+
     /// Copy the code values to the host. Waits for the GPU.
     pub fn download(&self, device: &wgpu::Device, queue: &wgpu::Queue) -> Result<Frame, GpuError> {
         let bytes = read_buffer(device, queue, &self.samples, sample_bytes(&self.header))?;
@@ -505,6 +522,7 @@ impl GpuFrame {
                 .map(|h| u16::from_le_bytes([h[0], h[1]]))
                 .collect(),
             skipped_tiles: self.skipped_tiles.clone(),
+            max_qscale: self.max_qscale,
         })
     }
 }
