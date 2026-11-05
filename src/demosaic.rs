@@ -152,7 +152,7 @@ pub fn output_matrix(header: &FrameHeader, exposure: Exposure) -> [f32; 9] {
     })
 }
 
-/// An RGB image of `f32` values.
+/// An RGB image of `f32` values, interleaved.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RgbImage {
     /// Width in pixels.
@@ -161,6 +161,18 @@ pub struct RgbImage {
     pub height: usize,
     /// Interleaved R, G, B, row-major, tightly packed.
     pub data: Vec<f32>,
+}
+
+/// An RGB image of `f32` values as three planes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RgbPlanes {
+    /// Width in pixels.
+    pub width: usize,
+    /// Height in pixels.
+    pub height: usize,
+    /// The R, G and B planes, each row-major and tightly packed
+    /// (`width * height` values).
+    pub planes: [Vec<f32>; 3],
 }
 
 /// Run Apple's raw conversion on a decoded frame up to `stage`, with the
@@ -204,6 +216,47 @@ pub fn develop_into(frame: &Frame, params: &DemosaicParams, stage: Stage, out: &
     Conversion::new(frame, params, stage).run_interleaved(frame, out);
 }
 
+/// [`develop_with`] with the result as three planes, the layout most raw
+/// developers and GPU uploads want. Values are bit-identical to the
+/// interleaved forms.
+pub fn develop_planar(frame: &Frame, params: &DemosaicParams, stage: Stage) -> RgbPlanes {
+    let (width, height) = (frame.width(), frame.height());
+    let mut planes: [Vec<f32>; 3] = std::array::from_fn(|_| vec![0f32; width * height]);
+    let [r, g, b] = &mut planes;
+    develop_planar_into(frame, params, stage, [r, g, b]);
+    RgbPlanes {
+        width,
+        height,
+        planes,
+    }
+}
+
+/// [`develop_planar`] into caller-owned R, G and B planes, each row-major
+/// and tightly packed.
+///
+/// # Panics
+///
+/// If a plane does not hold exactly `width * height` values.
+pub fn develop_planar_into(
+    frame: &Frame,
+    params: &DemosaicParams,
+    stage: Stage,
+    out: [&mut [f32]; 3],
+) {
+    let (w, h) = (frame.width(), frame.height());
+    for plane in &out {
+        assert_eq!(plane.len(), w * h, "plane size");
+    }
+    Conversion::new(frame, params, stage).run_planar(frame, out);
+}
+
+/// Where one band of [`Conversion`] writes its finished rows: the band's
+/// slice of an interleaved image, or its slice of each plane.
+enum BandOut<'a> {
+    Interleaved(&'a mut [f32]),
+    Planar([&'a mut [f32]; 3]),
+}
+
 /// Per-band scratch: normalized rows and green-pass rows.
 type Scratch = (Vec<f32>, Vec<[f32; 2]>);
 
@@ -241,7 +294,7 @@ impl Conversion {
     fn run_interleaved(&self, frame: &Frame, out: &mut [f32]) {
         let chunk = 3 * frame.width() * BAND;
         let band = |scratch: &mut Scratch, (index, rows): (usize, &mut [f32])| {
-            self.band(frame, index, rows, scratch);
+            self.band(frame, index, BandOut::Interleaved(rows), scratch);
         };
         #[cfg(feature = "parallel")]
         {
@@ -259,10 +312,36 @@ impl Conversion {
         }
     }
 
+    fn run_planar(&self, frame: &Frame, [r, g, b]: [&mut [f32]; 3]) {
+        let chunk = frame.width() * BAND;
+        type Item<'a> = (usize, ((&'a mut [f32], &'a mut [f32]), &'a mut [f32]));
+        let band = |scratch: &mut Scratch, (index, ((r, g), b)): Item<'_>| {
+            self.band(frame, index, BandOut::Planar([r, g, b]), scratch);
+        };
+        #[cfg(feature = "parallel")]
+        {
+            use rayon::prelude::*;
+            r.par_chunks_mut(chunk)
+                .zip(g.par_chunks_mut(chunk))
+                .zip(b.par_chunks_mut(chunk))
+                .enumerate()
+                .for_each_init(Scratch::default, band);
+        }
+        #[cfg(not(feature = "parallel"))]
+        {
+            let mut scratch = Scratch::default();
+            r.chunks_mut(chunk)
+                .zip(g.chunks_mut(chunk))
+                .zip(b.chunks_mut(chunk))
+                .enumerate()
+                .for_each(|item| band(&mut scratch, item));
+        }
+    }
+
     /// Run every pass over band `index`, writing its rows to `out`. A band
     /// needs green one row beyond it and normalized values three rows
     /// beyond, recomputed at the seams, so that its data stays in cache.
-    fn band(&self, frame: &Frame, index: usize, out: &mut [f32], scratch: &mut Scratch) {
+    fn band(&self, frame: &Frame, index: usize, mut out: BandOut<'_>, scratch: &mut Scratch) {
         let p = &self.params;
         let (w, h) = (frame.width(), frame.height());
         let y0 = index * BAND;
@@ -287,10 +366,22 @@ impl Conversion {
         for (i, y) in (y0..y1).enumerate() {
             let (ym, yp) = mirrored(y, h);
             let rows = [g(ym), g(y), g(yp)];
-            chroma_row(rows, y, p, &mut out[3 * w * i..3 * w * (i + 1)]);
+            match &mut out {
+                BandOut::Interleaved(o) => {
+                    chroma_row(rows, y, p, &mut o[3 * w * i..3 * w * (i + 1)])
+                }
+                BandOut::Planar([r, g, b]) => {
+                    let span = w * i..w * (i + 1);
+                    let planes = [&mut r[span.clone()], &mut g[span.clone()], &mut b[span]];
+                    chroma_row_planar(rows, y, p, planes);
+                }
+            }
         }
         if let Some(m) = &self.matrix {
-            matrix_rows(out, m);
+            match out {
+                BandOut::Interleaved(o) => matrix_rows(o, m),
+                BandOut::Planar([r, g, b]) => matrix_planes([r, g, b], m),
+            }
         }
     }
 }
@@ -517,6 +608,37 @@ pub fn chroma_pass(green: &[[f32; 2]], w: usize, h: usize, p: &DemosaicParams) -
 /// below it (mirrored at the picture edges), into interleaved RGB.
 #[inline(always)]
 fn chroma_row_impl(rows: [&[[f32; 2]]; 3], y: usize, p: &DemosaicParams, out: &mut [f32]) {
+    let out = &mut out[..3 * rows[1].len()];
+    chroma_row_with(rows, y, p, |x, rgb| {
+        out[3 * x..3 * x + 3].copy_from_slice(&rgb);
+    });
+}
+
+/// [`chroma_row_impl`] into one row of each of the R, G and B planes.
+#[inline(always)]
+fn chroma_row_planar_impl(
+    rows: [&[[f32; 2]]; 3],
+    y: usize,
+    p: &DemosaicParams,
+    [r, g, b]: [&mut [f32]; 3],
+) {
+    let w = rows[1].len();
+    let (r, g, b) = (&mut r[..w], &mut g[..w], &mut b[..w]);
+    chroma_row_with(rows, y, p, |x, rgb| {
+        r[x] = rgb[0];
+        g[x] = rgb[1];
+        b[x] = rgb[2];
+    });
+}
+
+/// The chroma pass of one row, handing each pixel's finished RGB to `put`.
+#[inline(always)]
+fn chroma_row_with(
+    rows: [&[[f32; 2]]; 3],
+    y: usize,
+    p: &DemosaicParams,
+    mut put: impl FnMut(usize, [f32; 3]),
+) {
     let [up, mid, down] = rows;
     let w = mid.len();
     let off = p.black_over_range;
@@ -525,7 +647,7 @@ fn chroma_row_impl(rows: [&[[f32; 2]]; 3], y: usize, p: &DemosaicParams, out: &m
     let red_col = (p.cfa_phase & 1) as usize;
     // Column parity of the red or blue sites of this row.
     let rb_col = if on_red_row { red_col } else { 1 - red_col };
-    for (x, o) in out.chunks_exact_mut(3).enumerate() {
+    for x in 0..w {
         let (xm, xp) = mirrored(x, w);
         let [c, g] = mid[x];
         let centre = Centre {
@@ -546,9 +668,10 @@ fn chroma_row_impl(rows: [&[[f32; 2]]; 3], y: usize, p: &DemosaicParams, out: &m
             let ev = pair(up[x], down[x]);
             if on_red_row { (eh, ev) } else { (ev, eh) }
         };
-        o[0] = (r * p.wb[0]).min(1.0);
-        o[1] = g.min(1.0);
-        o[2] = (b * p.wb[1]).min(1.0);
+        put(
+            x,
+            [(r * p.wb[0]).min(1.0), g.min(1.0), (b * p.wb[1]).min(1.0)],
+        );
     }
 }
 
@@ -568,6 +691,19 @@ fn matrix_rows_impl(rgb: &mut [f32], m: &[f32; 9]) {
         for (v, i) in px.iter_mut().zip([0, 3, 6]) {
             *v = fma(b, m[i + 2], fma(r, m[i], g * m[i + 1]));
         }
+    }
+}
+
+/// [`matrix_rows_impl`] on R, G and B planes of equal length.
+#[inline(always)]
+fn matrix_planes_impl([r, g, b]: [&mut [f32]; 3], m: &[f32; 9]) {
+    let n = r.len();
+    let (g, b) = (&mut g[..n], &mut b[..n]);
+    for i in 0..n {
+        let [rv, gv, bv] = [r[i], g[i], b[i]];
+        r[i] = fma(bv, m[2], fma(rv, m[0], gv * m[1]));
+        g[i] = fma(bv, m[5], fma(rv, m[3], gv * m[4]));
+        b[i] = fma(bv, m[8], fma(rv, m[6], gv * m[7]));
     }
 }
 
@@ -620,7 +756,11 @@ dispatch! {
     fn chroma_row => chroma_row_impl(
         rows: [&[[f32; 2]]; 3], y: usize, p: &DemosaicParams, out: &mut [f32]
     );
+    fn chroma_row_planar => chroma_row_planar_impl(
+        rows: [&[[f32; 2]]; 3], y: usize, p: &DemosaicParams, out: [&mut [f32]; 3]
+    );
     fn matrix_rows => matrix_rows_impl(rgb: &mut [f32], m: &[f32; 9]);
+    fn matrix_planes => matrix_planes_impl(rgb: [&mut [f32]; 3], m: &[f32; 9]);
 }
 
 #[cfg(test)]
@@ -795,11 +935,11 @@ mod tests {
         assert_eq!(rec2020, apply_matrix(&balanced, &m));
     }
 
-    /// A caller-owned buffer gets the same values as a fresh image, at
-    /// every stage, including frames whose height is not a whole number
-    /// of bands.
+    /// The planar and caller-owned forms carry the same values as the
+    /// interleaved image, at every stage, including frames whose height is
+    /// not a whole number of bands.
     #[test]
-    fn develop_into_matches_develop_with() {
+    fn planar_and_interleaved_outputs_agree() {
         let mut rng = crate::synth::Rng::new(10);
         let spec = crate::synth::Spec {
             valid_tiles: true,
@@ -809,13 +949,31 @@ mod tests {
         let packet = crate::synth::random_frame(&spec, &mut rng);
         let frame = crate::decode_frame(&packet).unwrap();
         let params = DemosaicParams::new(&frame.header, frame.quantizer());
+        let n = frame.width() * frame.height();
         assert!(frame.height() % BAND != 0);
         for stage in [Stage::Demosaiced, Stage::WhiteBalanced, Stage::Rec2020] {
             let image = develop_with(&frame, &params, stage);
-            let mut reused = vec![f32::NAN; image.data.len()];
+            let mut reused = vec![f32::NAN; 3 * n];
             develop_into(&frame, &params, stage, &mut reused);
             assert_eq!(reused, image.data, "{stage:?}");
+            let planar = develop_planar(&frame, &params, stage);
+            assert_eq!((planar.width, planar.height), (image.width, image.height));
+            for (c, plane) in planar.planes.iter().enumerate() {
+                let want: Vec<f32> = image.data.iter().skip(c).step_by(3).copied().collect();
+                assert_eq!(plane, &want, "{stage:?} channel {c}");
+            }
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "plane size")]
+    fn planar_output_must_fit_the_frame() {
+        let mut rng = crate::synth::Rng::new(11);
+        let spec = crate::synth::Spec::new(32, 16, BayerPattern::Rggb);
+        let frame = crate::decode_frame(&crate::synth::random_frame(&spec, &mut rng)).unwrap();
+        let params = DemosaicParams::new(&frame.header, frame.quantizer());
+        let (mut r, mut g, mut b) = (vec![0.0; 32 * 16], vec![0.0; 32 * 16], vec![0.0; 10]);
+        develop_planar_into(&frame, &params, Stage::default(), [&mut r, &mut g, &mut b]);
     }
 
     #[test]

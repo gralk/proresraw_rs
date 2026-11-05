@@ -90,7 +90,16 @@ ones before it:
 
 Stop before `Rec2020` to do your own colour management.
 `develop_with(&frame, &params, stage)` takes explicit `DemosaicParams`,
-for example your own white balance gains. The passes are also public
+for example your own white balance gains.
+
+The result comes interleaved (`RgbImage`) or as three planes
+(`develop_planar`, returning `RgbPlanes`), with the same values either
+way. Planes are what most raw pipelines and GPU uploads want, and
+writing them directly avoids a second pass and a second full-size
+buffer. `develop_into` and `develop_planar_into` write into buffers the
+caller owns, for reusing them from frame to frame; on Linux that alone
+saves about a third of the conversion time, which otherwise goes to
+page faults on the fresh allocation. The passes are also public
 (`demosaic::green_pass`, `chroma_pass`, `apply_matrix`, with
 `output_matrix(&header, Exposure::Reflection)` for Apple's other exposure
 scaling).
