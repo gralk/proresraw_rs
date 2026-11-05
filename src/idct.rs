@@ -173,6 +173,79 @@ pub fn apple_block(coefs: &[i16; 64], q: &[i16; 64]) -> [u16; 64] {
     out
 }
 
+/// Row tables of the 4-point transform for even and odd coefficient rows:
+/// the weight of (x0 ± x2) in the even part, then the weights of x1 and
+/// x3 in the two odd outputs.
+const ROW4_TABLES: [(i32, [i32; 4]); 2] = [
+    (8192, [10703, 4433, 4433, -10703]),
+    (10703, [13985, 5793, 5793, -13985]),
+];
+
+/// Column-pass scale of the 4-point transform: 2^-13.
+const SCALE4: f32 = f32::from_bits(0x3900_0000);
+
+/// Saturate a centred value to 16 bits and offset it to a code value.
+#[inline(always)]
+fn saturate_code(v: i32) -> u16 {
+    (v.clamp(-32768, 32767) as i16 as u16) ^ 0x8000
+}
+
+/// Apple-compatible dequantize + 4×4 inverse transform, used for
+/// quarter-resolution decoding. `coefs` is the top-left 4×4 corner of a
+/// block in raster order; `q` is the full 8×8 quantizer table, of which
+/// the matching corner is used. Returns 16 code values in raster order.
+pub fn apple_block_4x4(coefs: &[i16; 16], q: &[i16; 64]) -> [u16; 16] {
+    let mut rows = [[0f32; 4]; 4];
+    for (r, row) in rows.iter_mut().enumerate() {
+        let x: [i32; 4] =
+            std::array::from_fn(|c| i32::from(dequantize(coefs[4 * r + c], q[8 * r + c])));
+        let (k, t) = ROW4_TABLES[r & 1];
+        let e0 = k * x[0] + k * x[2];
+        let e1 = k * x[0] - k * x[2];
+        let o0 = t[0] * x[1] + t[1] * x[3];
+        let o1 = t[2] * x[1] + t[3] * x[3];
+        let y = [e0 + o0, e1 + o1, e1 - o1, e0 - o0];
+        for (o, v) in row.iter_mut().zip(y) {
+            *o = v as f32 * SCALE4;
+        }
+    }
+    let mut out = [0u16; 16];
+    for c in 0..4 {
+        let r0 = rows[0][c] + BIAS;
+        let (r1, r2, r3) = (rows[1][c], rows[2][c], rows[3][c]);
+        let e0 = r2 + r0;
+        let e1 = r0 - r2;
+        let f = r3 * TAN2 + r1;
+        let g = r1 * TAN2 - r3;
+        let y = [f + e0, g + e1, e1 - g, e0 - f];
+        for (i, v) in y.into_iter().enumerate() {
+            out[4 * i + c] = output_code(v);
+        }
+    }
+    out
+}
+
+/// Apple-compatible dequantize + 2×2 inverse transform (sums and
+/// differences, no scaling), used for eighth-resolution decoding. `coefs`
+/// is the top-left 2×2 corner of a block in raster order; `q` is the full
+/// 8×8 quantizer table. Returns 4 code values in raster order.
+pub fn apple_block_2x2(coefs: &[i16; 4], q: &[i16; 64]) -> [u16; 4] {
+    let d = [
+        i32::from(dequantize(coefs[0], q[0])),
+        i32::from(dequantize(coefs[1], q[1])),
+        i32::from(dequantize(coefs[2], q[8])),
+        i32::from(dequantize(coefs[3], q[9])),
+    ];
+    let (top_sum, top_diff) = (d[0] + d[1], d[0] - d[1]);
+    let (bottom_sum, bottom_diff) = (d[2] + d[3], d[2] - d[3]);
+    [
+        saturate_code(top_sum + bottom_sum),
+        saturate_code(top_diff + bottom_diff),
+        saturate_code(top_sum - bottom_sum),
+        saturate_code(top_diff - bottom_diff),
+    ]
+}
+
 // ---------------------------------------------------------------------------
 // FFmpeg simple IDCT
 
