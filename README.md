@@ -39,9 +39,13 @@ can store frames turned. The Blackmagic Camera app on the iPhone 17 Pro
 stores 4:3 frames upside down and marks the track as turned 180°
 (matrix `[-1 0; 0 -1]`), while its 16:9 frames are stored upright. The
 frame headers of the two are otherwise alike. A reader that ignores the
-matrix shows those clips upside down. Turn the picture after decoding,
-and remember that the Bayer pattern and crop turn with it (RGGB turned
-180° is BGGR).
+matrix shows those clips upside down.
+
+`mov::Track::orientation` reads the matrix as one of the eight EXIF
+orientations (`Orientation::exif()` gives the 1–8 value). Turn the
+picture after decoding, and remember that the Bayer pattern and crop
+turn with it (RGGB turned 180° is BGGR). A matrix that is not a quarter
+turn or mirror leaves the frames as stored, with a warning on the track.
 
 ## Status
 

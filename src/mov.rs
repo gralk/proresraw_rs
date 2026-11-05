@@ -112,10 +112,48 @@ pub struct Track {
     pub samples: Vec<Sample>,
     /// Movie creation time, seconds since 1904-01-01 UTC (mvhd), when non-zero.
     pub creation_time: Option<u64>,
+    /// How to turn the stored frames for display, from the track's matrix.
+    /// Decoded frames, with their Bayer pattern and crop, are as stored.
+    pub orientation: Orientation,
     /// Conditions a caller should report once per clip (edit list oddities etc.).
     pub warnings: Vec<String>,
     /// The movie's text metadata items (`moov/meta`, `mdta` keys), in file order.
     pub metadata: Vec<(String, String)>,
+}
+
+/// How a track's stored frames are turned or mirrored for display: the
+/// eight symmetries of a rectangle, named as the EXIF and TIFF orientations
+/// are. Each says what to do to the stored frame to show it upright.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum Orientation {
+    /// Shown as stored (EXIF 1).
+    #[default]
+    Identity,
+    /// Mirrored left to right (EXIF 2).
+    MirrorHorizontal,
+    /// Turned 180° (EXIF 3).
+    Rotate180,
+    /// Mirrored top to bottom (EXIF 4).
+    MirrorVertical,
+    /// Mirrored about the main diagonal: rows become columns (EXIF 5).
+    Transpose,
+    /// Turned 90° clockwise (EXIF 6), as for a phone held upright.
+    Rotate90,
+    /// Mirrored about the anti-diagonal (EXIF 7).
+    Transverse,
+    /// Turned 90° anticlockwise (EXIF 8).
+    Rotate270,
+}
+
+impl Orientation {
+    /// The EXIF / TIFF `Orientation` value, 1 to 8.
+    pub fn exif(self) -> u8 {
+        self as u8 + 1
+    }
+    /// Whether display swaps the stored width and height.
+    pub fn swaps_dimensions(self) -> bool {
+        self.exif() >= 5
+    }
 }
 
 impl Track {
@@ -257,6 +295,7 @@ fn parse_movie(moov: &[u8], length: u64, accept: fn(&[u8; 4]) -> bool) -> Result
 struct Video<'a> {
     fourcc: [u8; 4],
     timescale: u32,
+    tkhd: &'a [u8],
     elst: Option<&'a [u8]>,
     stbl: Vec<Atom<'a>>,
 }
@@ -295,6 +334,7 @@ fn video_track(trak: &[u8]) -> Result<Option<Video<'_>>> {
     Ok(Some(Video {
         fourcc,
         timescale,
+        tkhd,
         elst,
         stbl,
     }))
@@ -309,6 +349,7 @@ impl Video<'_> {
         let (mode, variable_durations) = common_duration(&durations);
         let divisor = gcd(self.timescale, mode);
         let mut warnings = Vec::new();
+        let orientation = orientation(self.tkhd, &mut warnings)?;
         let presented = match self.elst {
             Some(elst) => edit(
                 elst,
@@ -330,6 +371,7 @@ impl Video<'_> {
             variable_durations,
             samples: samples[presented].to_vec(),
             creation_time: None,
+            orientation,
             warnings,
             metadata: Vec::new(),
         })
@@ -606,6 +648,48 @@ fn times(body: &[u8], kind: &[u8; 4]) -> Result<(u64, u32)> {
     }
 }
 
+/// The orientation of a `tkhd`'s display matrix: the turn or mirror that
+/// shows the stored frames upright. QuickTime maps a stored point `(x, y)`
+/// to `(a·x + c·y + tx, b·x + d·y + ty)`; only the signs of the 16.16
+/// entries `a b c d` matter, since the translation just moves the turned
+/// frame back to the origin. A matrix that is none of a rectangle's eight
+/// symmetries (a skew, an arbitrary angle) shows the frames as stored and
+/// adds a warning; scale is ignored.
+fn orientation(tkhd: &[u8], warnings: &mut Vec<String>) -> Result<Orientation> {
+    // Version and flags, the times, track ID and duration, then 8 reserved
+    // bytes and layer, alternate group, volume and 2 reserved: 40 bytes in
+    // version 0, 52 with version 1's 64-bit times and duration.
+    let at = match tkhd.first() {
+        Some(0) => 40,
+        Some(1) => 52,
+        Some(version) => bail!("`tkhd` version {version} is not supported"),
+        None => bail!("truncated `tkhd` atom"),
+    };
+    let entry = |i: usize| -> Result<f64> {
+        Ok(f64::from(u32_at(tkhd, at + 4 * i, b"tkhd")? as i32) / 65536.0)
+    };
+    // Row-major a b u / c d v / tx ty w.
+    let (a, b, c, d) = (entry(0)?, entry(1)?, entry(3)?, entry(4)?);
+    let sign = |v: f64| i8::from(v > 0.0) - i8::from(v < 0.0);
+    Ok(match (sign(a), sign(b), sign(c), sign(d)) {
+        (1, 0, 0, 1) => Orientation::Identity,
+        (-1, 0, 0, 1) => Orientation::MirrorHorizontal,
+        (-1, 0, 0, -1) => Orientation::Rotate180,
+        (1, 0, 0, -1) => Orientation::MirrorVertical,
+        (0, 1, 1, 0) => Orientation::Transpose,
+        (0, 1, -1, 0) => Orientation::Rotate90,
+        (0, -1, -1, 0) => Orientation::Transverse,
+        (0, -1, 1, 0) => Orientation::Rotate270,
+        _ => {
+            warnings.push(format!(
+                "the video track's display matrix [{a} {b}; {c} {d}] is not a quarter turn \
+                 or mirror, so the frames are shown as stored"
+            ));
+            Orientation::Identity
+        }
+    })
+}
+
 /// The child atoms of `data`.
 fn children(data: &[u8]) -> Result<Vec<Atom<'_>>> {
     let mut atoms = Vec::new();
@@ -760,6 +844,9 @@ mod tests {
         co64: bool,
         /// (segment duration, media time).
         edits: Vec<(u32, i32)>,
+        tkhd_version: u8,
+        /// The display matrix's `a b c d`, 16.16.
+        matrix: [i32; 4],
     }
     impl Default for Spec {
         fn default() -> Self {
@@ -774,13 +861,25 @@ mod tests {
                 chunks: vec![2, 2, 1],
                 co64: false,
                 edits: Vec::new(),
+                tkhd_version: 0,
+                matrix: [0x1_0000, 0, 0, 0x1_0000],
             }
         }
     }
     /// A `trak` whose samples start at byte `data` of the file, back to back.
     fn trak(spec: &Spec, data: u64) -> Vec<u8> {
-        let mut tkhd = vec![0; 80];
-        tkhd[..4].copy_from_slice(&u32::from(spec.enabled).to_be_bytes());
+        // Version and flags, then the fields before the matrix (36 or 48
+        // bytes), the matrix and the width and height.
+        let at = if spec.tkhd_version == 0 { 40 } else { 52 };
+        let mut tkhd = vec![0; at + 44];
+        tkhd[..4].copy_from_slice(
+            &(u32::from(spec.enabled) | u32::from(spec.tkhd_version) << 24).to_be_bytes(),
+        );
+        let [a, b, c, d] = spec.matrix;
+        let matrix = [a, b, 0, c, d, 0, 0, 0, 0x4000_0000];
+        for (i, v) in matrix.iter().enumerate() {
+            tkhd[at + 4 * i..][..4].copy_from_slice(&v.to_be_bytes());
+        }
         let mut body = atom(b"tkhd", &tkhd);
         if !spec.edits.is_empty() {
             let mut elst = words(&[0, spec.edits.len() as u32]);
@@ -1035,6 +1134,75 @@ mod tests {
         assert_eq!(message(read(&path)), "the movie has no enabled video track");
     }
     #[test]
+    fn display_matrices_set_the_orientation() {
+        const ONE: i32 = 0x1_0000;
+        use Orientation::*;
+        for (matrix, orientation) in [
+            ([ONE, 0, 0, ONE], Identity),
+            ([-ONE, 0, 0, ONE], MirrorHorizontal),
+            ([-ONE, 0, 0, -ONE], Rotate180),
+            ([ONE, 0, 0, -ONE], MirrorVertical),
+            ([0, ONE, ONE, 0], Transpose),
+            // A phone held upright: the stored frame turns a quarter clockwise.
+            ([0, ONE, -ONE, 0], Rotate90),
+            ([0, -ONE, -ONE, 0], Transverse),
+            ([0, -ONE, ONE, 0], Rotate270),
+            // Scale is ignored.
+            ([-2 * ONE, 0, 0, -ONE / 2], Rotate180),
+        ] {
+            for tkhd_version in [0, 1] {
+                let (_dir, path) = movie(&[Spec {
+                    matrix,
+                    tkhd_version,
+                    ..Spec::default()
+                }]);
+                let track = read(&path).unwrap();
+                assert_eq!(
+                    track.orientation, orientation,
+                    "{matrix:?} in tkhd version {tkhd_version}"
+                );
+                assert!(track.warnings.is_empty(), "{:?}", track.warnings);
+            }
+        }
+    }
+
+    #[test]
+    fn orientations_have_their_exif_values() {
+        use Orientation::*;
+        let all = [
+            Identity,
+            MirrorHorizontal,
+            Rotate180,
+            MirrorVertical,
+            Transpose,
+            Rotate90,
+            Transverse,
+            Rotate270,
+        ];
+        for (i, orientation) in all.into_iter().enumerate() {
+            assert_eq!(orientation.exif() as usize, i + 1);
+            assert_eq!(orientation.swaps_dimensions(), i >= 4);
+        }
+    }
+
+    #[test]
+    fn other_display_matrices_show_frames_as_stored() {
+        // 45 degrees.
+        let (_dir, path) = movie(&[Spec {
+            matrix: [46341, 46341, -46341, 46341],
+            ..Spec::default()
+        }]);
+        let track = read(&path).unwrap();
+        assert_eq!(track.orientation, Orientation::Identity);
+        assert_eq!(track.warnings.len(), 1, "{:?}", track.warnings);
+        assert!(
+            track.warnings[0].contains("not a quarter turn or mirror"),
+            "{}",
+            track.warnings[0]
+        );
+    }
+
+    #[test]
     fn other_codecs_are_named() {
         let spec = Spec {
             fourcc: *b"apch",
@@ -1156,12 +1324,21 @@ mod tests {
             assert!(track.warnings.is_empty(), "{clip}: {:?}", track.warnings);
             let found = track.text(&["com.apple.proapps.manufacturer", "com.apple.quicktime.make"]);
             assert_eq!(found, Some(make), "{clip}");
+            assert_eq!(track.orientation, Orientation::Identity, "{clip}");
             for sample in [track.samples[0], track.samples[frames - 1]] {
                 let mut head = [0; 8];
                 read_at(&file, sample.offset, &mut head).unwrap();
                 assert_eq!(be32(&head), sample.size, "{clip}");
                 assert_eq!(&head[4..], b"prrf", "{clip}");
             }
+        }
+        // The Blackmagic Camera app stores the iPhone's 4:3 frames upside
+        // down and turns them with the track matrix.
+        let clip = "iphone17-prores_raw/01_A001_09211049_C068.mov";
+        let path = root.join(clip);
+        if path.is_file() {
+            let track = read_video_track(&File::open(&path).unwrap(), prores_raw).unwrap();
+            assert_eq!(track.orientation, Orientation::Rotate180, "{clip}");
         }
     }
 }
