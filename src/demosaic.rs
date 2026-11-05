@@ -152,7 +152,8 @@ pub fn output_matrix(header: &FrameHeader, exposure: Exposure) -> [f32; 9] {
     })
 }
 
-/// An RGB image of `f32` values, interleaved.
+/// An RGB image of `f32` values, interleaved, normalized so that 0 is
+/// black and 1 sensor white (before white balance and matrix).
 #[derive(Debug, Clone, PartialEq)]
 pub struct RgbImage {
     /// Width in pixels.
@@ -163,7 +164,8 @@ pub struct RgbImage {
     pub data: Vec<f32>,
 }
 
-/// An RGB image of `f32` values as three planes.
+/// An RGB image of `f32` values as three planes, normalized like
+/// [`RgbImage`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct RgbPlanes {
     /// Width in pixels.
@@ -192,7 +194,15 @@ pub fn develop(frame: &Frame, stage: Stage) -> RgbImage {
 
 /// Like [`develop`] with explicit parameters, for example white balance
 /// gains of your own ([`DemosaicParams::with_white_balance`]). At
-/// [`Stage::Demosaiced`] the gains in `params` are ignored.
+/// [`Stage::Demosaiced`] the gains in `params` are ignored and every
+/// channel clips at exactly 1.0, sensor white, so a consumer needs no
+/// clip-level estimate of its own.
+///
+/// Values are normalized `f32`: 0 is black and 1 is the header white
+/// level. The other decoders return unnormalized `u16` linear values
+/// ([`crate::Frame::linearize`], [`crate::decode_frame_reduced`]), with
+/// [`crate::BLACK_LEVEL`] and [`FrameHeader::white_level`] still to be
+/// applied.
 pub fn develop_with(frame: &Frame, params: &DemosaicParams, stage: Stage) -> RgbImage {
     let (width, height) = (frame.width(), frame.height());
     let mut data = vec![0f32; 3 * width * height];

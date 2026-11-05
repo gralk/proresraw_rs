@@ -133,6 +133,12 @@ impl RgbFrame {
 
 /// Decode one frame packet at a reduced resolution with the
 /// Apple-compatible inverse transforms, green from the first green stream.
+///
+/// Values are linear `u16` sensor values on the full-resolution scale,
+/// like [`Frame::linearize`](crate::Frame::linearize): black is
+/// [`BLACK_LEVEL`](crate::BLACK_LEVEL) and white
+/// [`FrameHeader::white_level`]. [`crate::develop_with`] instead returns
+/// `f32` already normalized to 0–1.
 pub fn decode_frame_reduced(packet: &[u8], scale: Scale) -> Result<RgbFrame> {
     decode_frame_reduced_with(packet, scale, Greens::First)
 }
