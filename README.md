@@ -42,6 +42,17 @@ Demuxing is out of scope: any QuickTime reader that yields samples works.
 - Tile rows decode in parallel on rayon (feature `parallel`, on by
   default). A 5.8K frame decodes in about 45 ms on a desktop CPU.
 
+## Reduced resolution
+
+`decode_frame_reduced(packet, Scale::Half | Quarter | Eighth)` decodes
+linear RGB with one pixel per 2×2, 4×4 or 8×8 sensels, as Apple's
+decoder does for previews: the second green stream is skipped, and
+quarter and eighth resolution read only the leading 16 or 4 coefficients
+of every block and run a 4×4 or 2×2 inverse transform. The transforms
+are Apple-compatible bit for bit; half resolution equals the full decode
+sampled at the red, first green and blue sensels. On a 4K frame, half,
+quarter and eighth take about 16, 7 and 4 ms.
+
 ## GPU decoding
 
 With the `gpu` feature, `GpuDecoder` decodes on a wgpu device the

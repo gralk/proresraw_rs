@@ -34,6 +34,7 @@ pub mod error;
 pub mod gpu;
 pub mod header;
 pub mod idct;
+pub mod reduced;
 /// Synthetic frames for decoder tests, exposed with the `testgen` feature.
 #[cfg(any(test, feature = "testgen"))]
 pub mod synth;
@@ -46,6 +47,7 @@ pub use error::{Error, Result};
 pub use gpu::{GpuDecoder, GpuError, GpuFrame};
 pub use header::{BLACK_LEVEL, BayerPattern, Color, Crop, FrameHeader};
 pub use idct::Idct;
+pub use reduced::{RgbFrame, Scale, decode_frame_reduced};
 
 /// QuickTime sample description FourCCs of ProRes RAW tracks.
 pub const FOURCCS: [&[u8; 4]; 2] = [b"aprn", b"aprh"];

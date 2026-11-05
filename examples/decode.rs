@@ -2,14 +2,18 @@
 //! written by `ffmpeg -i clip.mov -c:v copy -f rawvideo frames.bin`) and
 //! write it as a 16-bit binary PGM.
 //!
-//! Usage: `decode FRAMES.bin OUT.pgm [--frame N] [--linear] [--gpu]`
+//! Usage: `decode FRAMES.bin OUT.pgm [--frame N] [--linear] [--gpu]
+//! [--scale half|quarter|eighth]`
+//!
+//! `--scale` decodes at reduced resolution and writes a 16-bit binary PPM
+//! of linear RGB instead.
 //!
 //! `--gpu` (feature `gpu`) decodes on the default wgpu adapter and reports
 //! the steady-state time per frame over repeated decodes.
 
 use std::process::ExitCode;
 
-use proresraw_rs::{decode_frame, parse_frame};
+use proresraw_rs::{Scale, decode_frame, decode_frame_reduced, parse_frame};
 
 fn main() -> ExitCode {
     match run() {
@@ -28,11 +32,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut frame_index = 0usize;
     let mut linear = false;
     let mut gpu = false;
+    let mut scale = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--frame" => frame_index = args.next().ok_or("--frame needs a number")?.parse()?,
             "--linear" => linear = true,
             "--gpu" => gpu = true,
+            "--scale" => {
+                scale = Some(match args.next().as_deref() {
+                    Some("half") => Scale::Half,
+                    Some("quarter") => Scale::Quarter,
+                    Some("eighth") => Scale::Eighth,
+                    _ => return Err("--scale needs half, quarter or eighth".into()),
+                })
+            }
             other => return Err(format!("unknown argument {other}").into()),
         }
     }
@@ -41,6 +54,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let parsed = parse_frame(packet)?;
     eprintln!("{:#?}", parsed.header);
     eprintln!("{} tiles", parsed.tiles.len());
+    if let Some(scale) = scale {
+        let start = std::time::Instant::now();
+        let rgb = decode_frame_reduced(packet, scale)?;
+        eprintln!(
+            "decoded {scale:?} in {:.1} ms",
+            start.elapsed().as_secs_f64() * 1e3
+        );
+        let mut ppm = format!("P6\n{} {}\n65535\n", rgb.width(), rgb.height()).into_bytes();
+        ppm.extend(rgb.to_packed().iter().flat_map(|v| v.to_be_bytes()));
+        std::fs::write(&output, ppm)?;
+        return Ok(());
+    }
     let frame = if gpu {
         decode_on_gpu(packet)?
     } else {
