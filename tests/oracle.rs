@@ -102,3 +102,52 @@ fn gpu_matches_the_host_on_every_fixture() {
         );
     }
 }
+
+#[cfg(feature = "gpu")]
+#[test]
+fn gpu_develop_matches_the_host_on_every_fixture() {
+    use proresraw_rs::{DemosaicParams, GpuDecoder, GpuDeveloper, Stage, develop_planar};
+    let Some(dir) = fixture_dir() else {
+        eprintln!("PRORES_RAW_FIXTURES not set; skipping the GPU develop fixture test");
+        return;
+    };
+    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::from_env_or_default());
+    let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else {
+        eprintln!("no GPU adapter; skipping the GPU develop fixture test");
+        return;
+    };
+    let (device, queue) = pollster::block_on(adapter.request_device(&Default::default())).unwrap();
+    let mut decoder = GpuDecoder::new(&device);
+    let mut developer = GpuDeveloper::new(&device);
+    for packet_path in packets(&dir) {
+        let packet = std::fs::read(&packet_path).unwrap();
+        let host_frame = proresraw_rs::decode_frame(&packet).unwrap();
+        let params = DemosaicParams::new(&host_frame.header, host_frame.quantizer());
+        let frame = decoder.decode(&device, &queue, &packet).unwrap();
+        for stage in [Stage::Demosaiced, Stage::WhiteBalanced, Stage::Rec2020] {
+            let host = develop_planar(&host_frame, &params, stage);
+            let gpu = developer
+                .develop(&device, &queue, &frame, &params, stage)
+                .unwrap()
+                .download(&device, &queue)
+                .unwrap();
+            let mismatches: usize = gpu
+                .planes
+                .iter()
+                .zip(&host.planes)
+                .map(|(g, h)| {
+                    g.iter()
+                        .zip(h)
+                        .filter(|(a, b)| a.to_bits() != b.to_bits())
+                        .count()
+                })
+                .sum();
+            assert_eq!(
+                mismatches,
+                0,
+                "{} {stage:?}: {mismatches} values differ",
+                packet_path.display()
+            );
+        }
+    }
+}
