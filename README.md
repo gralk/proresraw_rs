@@ -30,7 +30,8 @@ presentation order after the first edit), frame rate, creation time and
 the movie's text metadata, and `mov::read_at` reads a sample from any
 thread. Any other QuickTime reader that yields samples works as well.
 `examples/decode.rs` turns a file of concatenated packets (as written by
-`ffmpeg -c:v copy -f rawvideo`) into a 16-bit PGM. `examples/prr2dng`
+`ffmpeg -c:v copy -f rawvideo`) into a 16-bit PGM. `examples/bench.rs`
+times the decoders and the conversion on such files. `examples/prr2dng`
 reads `.mov` clips directly and writes DNG sequences (see below).
 
 ### Orientation
@@ -124,8 +125,14 @@ passes agree to within 2·10⁻⁷ on a 0–1 scale. The remaining differences
 come from GPU division rounding, which varies between GPUs. Log and HLG
 output curves are not implemented.
 
-`develop` processes bands of rows so that every pass runs in cache. It
-takes about 50 ms for a 4K frame on 32 threads. On x86-64 the default
+`develop` processes bands of rows so that every pass runs in cache. On
+a 4K frame with 32 threads (and other load on the machine), converting
+into reused buffers takes 45–60 ms and converting into a fresh
+allocation 65–90 ms. The passes run on the caller's rayon pool, so
+conversions running side by side share its threads and each takes
+longer. `cargo run --release --example bench -- FRAME.bin...` prints
+decode, reduced-decode and conversion times for your machine and
+frames. On x86-64 the default
 feature `runtime-fma` runs the conversion kernels with AVX2 and FMA
 instructions when the CPU has them, through one small `unsafe` dispatch;
 without the feature the crate forbids unsafe code, and the conversion
