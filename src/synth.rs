@@ -3,7 +3,7 @@
 //! produces.
 
 use crate::header::{BLACK_LEVEL, BayerPattern, Crop};
-use crate::tile::TileGrid;
+use crate::tile::{TileGeometry, TileGrid};
 
 /// Small deterministic generator (xorshift64*).
 pub struct Rng(u64);
@@ -90,6 +90,13 @@ impl Spec {
 
 /// A frame packet with random tile headers and component streams.
 pub fn random_frame(spec: &Spec, rng: &mut Rng) -> Vec<u8> {
+    frame(spec, |t| random_tile(t.blocks(), spec.valid_tiles, rng))
+}
+
+/// A frame packet whose tile payloads, in frame order, come from `payload`
+/// given each tile's geometry; [`tile`] builds a payload from a qscale and
+/// four streams.
+pub fn frame(spec: &Spec, mut payload: impl FnMut(TileGeometry) -> Vec<u8>) -> Vec<u8> {
     let mut flags = u16::from(spec.alignment) << 1;
     let mut body = vec![0u8; 70];
     body[1] = 1;
@@ -126,10 +133,7 @@ pub fn random_frame(spec: &Spec, rng: &mut Rng) -> Vec<u8> {
         usize::from(spec.height),
         spec.alignment,
     );
-    let tiles: Vec<Vec<u8>> = grid
-        .tiles()
-        .map(|t| random_tile(t.blocks(), spec.valid_tiles, rng))
-        .collect();
+    let tiles: Vec<Vec<u8>> = grid.tiles().map(&mut payload).collect();
 
     let mut packet = Vec::new();
     packet.extend_from_slice(&0u32.to_be_bytes());
@@ -154,15 +158,27 @@ pub fn random_frame(spec: &Spec, rng: &mut Rng) -> Vec<u8> {
 fn random_tile(blocks: usize, valid: bool, rng: &mut Rng) -> Vec<u8> {
     let floor = u32::from(valid);
     let qscale = (floor + rng.below(256 - floor)) as u8;
-    let sizes: [usize; 4] =
-        std::array::from_fn(|_| (floor + rng.below(48 * blocks as u32 + 1 - floor)) as usize);
+    let sizes: [u32; 4] =
+        std::array::from_fn(|_| floor + rng.below(48 * blocks as u32 + 1 - floor));
+    // Bias towards zero bits so long codewords and early ends both occur.
+    let streams = sizes.map(|s| {
+        (0..s)
+            .map(|_| (rng.next_u32() & rng.next_u32()) as u8)
+            .collect::<Vec<u8>>()
+    });
+    tile(qscale, &streams.each_ref().map(Vec::as_slice))
+}
+
+/// A tile payload: the 8-byte header for `qscale` and the stream sizes,
+/// then the four streams in stored order. A zero qscale or an empty stream
+/// makes the tile invalid.
+pub fn tile(qscale: u8, streams: &[&[u8]; 4]) -> Vec<u8> {
     let mut tile = vec![8 << 3, qscale];
-    for s in &sizes[..3] {
-        tile.extend_from_slice(&(*s as u16).to_be_bytes());
+    for s in &streams[..3] {
+        tile.extend_from_slice(&(s.len() as u16).to_be_bytes());
     }
-    for s in sizes {
-        // Bias towards zero bits so long codewords and early ends both occur.
-        tile.extend((0..s).map(|_| (rng.next_u32() & rng.next_u32()) as u8));
+    for s in streams {
+        tile.extend_from_slice(s);
     }
     tile
 }
