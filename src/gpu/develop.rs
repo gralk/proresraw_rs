@@ -286,15 +286,20 @@ impl GpuDeveloper {
     ) -> Result<(), GpuError> {
         let needed = sample_bytes(header);
         let plane = plane_bytes(header);
-        for (buffer, needed) in std::iter::once((samples, needed)).chain(out.map(|b| (b, plane))) {
+        let inputs = std::iter::once((samples, needed, "samples"));
+        for (buffer, needed, what) in inputs.chain(out.map(|b| (b, plane, "plane"))) {
             if buffer.size() < needed {
-                return Err(GpuError::OutputTooSmall {
+                return Err(GpuError::BufferTooSmall {
+                    what,
                     size: buffer.size(),
                     needed,
                 });
             }
             if !buffer.usage().contains(wgpu::BufferUsages::STORAGE) {
-                return Err(GpuError::OutputNotStorage);
+                return Err(GpuError::MissingUsage {
+                    what,
+                    needs: wgpu::BufferUsages::STORAGE,
+                });
             }
         }
         let limits = device.limits();
@@ -496,15 +501,15 @@ mod tests {
         };
         assert!(matches!(
             run(&frame.samples, &buffer(plane - 4, storage)),
-            Err(GpuError::OutputTooSmall { .. })
+            Err(GpuError::BufferTooSmall { .. })
         ));
         assert!(matches!(
             run(&frame.samples, &buffer(plane, wgpu::BufferUsages::COPY_DST)),
-            Err(GpuError::OutputNotStorage)
+            Err(GpuError::MissingUsage { .. })
         ));
         assert!(matches!(
             run(&buffer(16, storage), &buffer(plane, storage)),
-            Err(GpuError::OutputTooSmall { .. })
+            Err(GpuError::BufferTooSmall { .. })
         ));
         assert!(run(&frame.samples, &buffer(plane, storage)).is_ok());
     }

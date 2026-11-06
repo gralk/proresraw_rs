@@ -48,6 +48,8 @@ const PACKET_PADDING: usize = 8;
 const STREAM_WORDS: usize = 4;
 /// Coefficient words of one 16×16 square: four blocks of 64 halves.
 const SQUARE_WORDS: u64 = 128;
+/// 32-bit words of the decoder's parameter block.
+const PARAMS_WORDS: u64 = 8 + 64;
 
 /// Why a frame could not be decoded on the GPU.
 #[derive(Debug)]
@@ -63,15 +65,32 @@ pub enum GpuError {
         /// The device's limit.
         limit: u64,
     },
-    /// The output buffer is smaller than the frame's samples.
-    OutputTooSmall {
-        /// Size of the buffer.
+    /// A buffer binding is smaller than the request it serves.
+    BufferTooSmall {
+        /// Which buffer.
+        what: &'static str,
+        /// Bytes available in the binding.
         size: u64,
-        /// Bytes the frame needs, see [`sample_bytes`].
+        /// Bytes the frame needs.
         needed: u64,
     },
-    /// The output buffer lacks `STORAGE` usage.
-    OutputNotStorage,
+    /// A buffer lacks a usage its request needs.
+    MissingUsage {
+        /// Which buffer.
+        what: &'static str,
+        /// The usages the request needs.
+        needs: wgpu::BufferUsages,
+    },
+    /// A binding's offset is not a multiple of the device's alignment for
+    /// its kind of binding.
+    Misaligned {
+        /// Which buffer.
+        what: &'static str,
+        /// The binding's offset.
+        offset: u64,
+        /// The alignment the device requires.
+        alignment: u64,
+    },
     /// Waiting for the GPU failed.
     Poll(wgpu::PollError),
     /// Mapping a buffer for reading failed.
@@ -85,10 +104,23 @@ impl fmt::Display for GpuError {
             GpuError::TooLarge { what, bytes, limit } => {
                 write!(f, "{what} needs {bytes} bytes, the device allows {limit}")
             }
-            GpuError::OutputTooSmall { size, needed } => {
-                write!(f, "output buffer of {size} bytes, the frame needs {needed}")
+            GpuError::BufferTooSmall { what, size, needed } => {
+                write!(
+                    f,
+                    "{what} binding of {size} bytes, the frame needs {needed}"
+                )
             }
-            GpuError::OutputNotStorage => write!(f, "output buffer lacks STORAGE usage"),
+            GpuError::MissingUsage { what, needs } => {
+                write!(f, "{what} buffer lacks usage {needs:?}")
+            }
+            GpuError::Misaligned {
+                what,
+                offset,
+                alignment,
+            } => write!(
+                f,
+                "{what} binding at offset {offset}, not a multiple of {alignment}"
+            ),
             GpuError::Poll(e) => write!(f, "waiting for the GPU: {e}"),
             GpuError::Map(e) => write!(f, "reading back from the GPU: {e}"),
         }
@@ -234,15 +266,20 @@ impl GpuPipelines {
             },
             count: None,
         };
+        // Every binding is read-write, even those the shaders only read:
+        // wgpu tracks usage per buffer within a dispatch, and a buffer
+        // bound once read-only and once read-write conflicts. Read-write
+        // throughout lets a caller sub-allocate every request from one
+        // buffer, at no measurable cost.
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("prores raw"),
             entries: &[
-                storage(0, true),
-                storage(1, true),
-                storage(2, true),
+                storage(0, false),
+                storage(1, false),
+                storage(2, false),
                 storage(3, false),
                 storage(4, false),
-                storage(5, true),
+                storage(5, false),
             ],
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -311,19 +348,19 @@ impl GpuDecoder {
         queue: &wgpu::Queue,
         packet: &[u8],
     ) -> Result<GpuFrame, GpuError> {
-        let parsed = parse_frame(packet)?;
+        let header = crate::decoder::parse_header(packet)?;
         let samples = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("prores raw samples"),
-            size: sample_bytes(&parsed.header),
+            size: sample_bytes(&header),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
-        let header = self.submit(device, queue, packet, parsed, &samples)?;
+        let info = self.submit(device, queue, packet, &samples)?;
         Ok(GpuFrame {
-            header,
+            header: info.header,
             samples,
-            skipped_tiles: self.skipped_tiles.clone(),
-            max_qscale: self.max_qscale,
+            skipped_tiles: info.skipped_tiles,
+            max_qscale: info.max_qscale,
         })
     }
 
@@ -354,157 +391,339 @@ impl GpuDecoder {
         packet: &[u8],
         samples: &wgpu::Buffer,
     ) -> Result<FrameHeader, GpuError> {
-        let parsed = parse_frame(packet)?;
-        let needed = sample_bytes(&parsed.header);
-        if samples.size() < needed {
-            return Err(GpuError::OutputTooSmall {
-                size: samples.size(),
-                needed,
-            });
-        }
-        if !samples.usage().contains(wgpu::BufferUsages::STORAGE) {
-            return Err(GpuError::OutputNotStorage);
-        }
-        self.submit(device, queue, packet, parsed, samples)
+        Ok(self.submit(device, queue, packet, samples)?.header)
     }
 
+    /// Record a decode into scratch from the slots and submit it.
     fn submit(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         packet: &[u8],
-        parsed: ParsedFrame<'_>,
         samples: &wgpu::Buffer,
-    ) -> Result<FrameHeader, GpuError> {
-        let (mut encoder, bind_group, layout) =
-            self.record_streams(device, queue, packet, &parsed, samples)?;
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("prores raw transform"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.pipelines.transform);
-            pass.set_bind_group(0, &bind_group, &[]);
-            pass.dispatch_workgroups(layout.squares_x, layout.squares_y, 1);
-        }
-        queue.submit([encoder.finish()]);
-        self.max_qscale = parsed.max_qscale;
-        Ok(parsed.header)
-    }
-
-    /// Upload a parsed frame and record the stream pass. Returns the
-    /// command encoder for further passes and the bind group of the frame.
-    fn record_streams(
-        &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        packet: &[u8],
-        parsed: &ParsedFrame<'_>,
-        samples: &wgpu::Buffer,
-    ) -> Result<(wgpu::CommandEncoder, wgpu::BindGroup, Layout), GpuError> {
-        let limits = device.limits();
-        let layout = Layout::new(&parsed.header);
-        let (table, skipped_squares) =
-            stream_table(packet, parsed, &layout, &mut self.skipped_tiles);
-        let check = |what, bytes: u64| {
-            let limit =
-                u64::from(limits.max_storage_buffer_binding_size).min(limits.max_buffer_size);
-            if bytes > limit {
-                Err(GpuError::TooLarge { what, bytes, limit })
-            } else {
-                Ok(())
-            }
+    ) -> Result<DecodeInfo, GpuError> {
+        let header = crate::decoder::parse_header(packet)?;
+        let f = decode_footprint(&header, packet.len());
+        let buffers = DecodeBuffers {
+            params: self
+                .params
+                .get(device, f.params.bytes)
+                .as_entire_buffer_binding(),
+            packet: self
+                .packet
+                .get(device, f.packet.bytes)
+                .as_entire_buffer_binding(),
+            streams: self
+                .streams
+                .get(device, f.streams.bytes)
+                .as_entire_buffer_binding(),
+            coefs: self
+                .coefs
+                .get(device, f.coefs.bytes)
+                .as_entire_buffer_binding(),
+            skipped: self
+                .skipped
+                .get(device, f.skipped.bytes)
+                .as_entire_buffer_binding(),
+            samples: samples.as_entire_buffer_binding(),
         };
-        let packet_bytes = (packet.len() + PACKET_PADDING) as u64;
-        // Stream offsets are addressed in bits with 32-bit arithmetic.
-        let bit_limit = u64::from(u32::MAX / 8);
-        if packet_bytes > bit_limit {
-            return Err(GpuError::TooLarge {
-                what: "packet",
-                bytes: packet_bytes,
-                limit: bit_limit,
-            });
-        }
-        check("packet", packet_bytes)?;
-        check("stream table", (table.len() * 4) as u64)?;
-        check("coefficients", layout.coef_bytes())?;
-        check("samples", layout.sample_bytes())?;
-
-        let params = params(&parsed.header, &layout, (table.len() / STREAM_WORDS) as u32);
-        let params_buf = self.params.get(device, (params.len() * 4) as u64);
-        queue.write_buffer(params_buf, 0, &words_to_bytes(&params));
-        let streams_buf = self
-            .streams
-            .get(device, (table.len().max(STREAM_WORDS) * 4) as u64);
-        queue.write_buffer(streams_buf, 0, &words_to_bytes(&table));
-        let packet_buf = self.packet.get(device, packet_bytes);
-        upload_padded(queue, packet_buf, packet);
-        let coefs_buf = self.coefs.get(device, layout.coef_bytes());
-        let skipped_buf = self.skipped.get(device, (skipped_squares.len() * 4) as u64);
-        queue.write_buffer(skipped_buf, 0, &words_to_bytes(&skipped_squares));
-
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("prores raw frame"),
-            layout: &self.pipelines.decode_layout,
-            entries: &[
-                entry(0, params_buf),
-                entry(1, packet_buf),
-                entry(2, streams_buf),
-                entry(3, coefs_buf),
-                entry(4, samples),
-                entry(5, skipped_buf),
-            ],
-        });
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("prores raw decode"),
         });
-        // The stream pass ORs coefficients into zeroed words; one fill is
-        // much cheaper than each invocation zeroing its scattered blocks.
-        encoder.clear_buffer(coefs_buf, 0, Some(layout.coef_bytes()));
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("prores raw streams"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.pipelines.decode_streams);
-            pass.set_bind_group(0, &bind_group, &[]);
-            let (x, y) = groups(
-                (table.len() / STREAM_WORDS) as u32,
-                limits.max_compute_workgroups_per_dimension,
-            );
-            pass.dispatch_workgroups(x, y, 1);
-        }
-        Ok((encoder, bind_group, layout))
+        let info = self
+            .pipelines
+            .record_decode(device, queue, &mut encoder, packet, &buffers)?;
+        queue.submit([encoder.finish()]);
+        self.skipped_tiles.clone_from(&info.skipped_tiles);
+        self.max_qscale = info.max_qscale;
+        Ok(info)
+    }
+}
+
+/// One buffer a GPU operation needs, as its footprint lists it: allocate a
+/// buffer (or a region of one) of at least `bytes` with at least `usage`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BufferRequest {
+    /// What the buffer is for, usable as a debug label.
+    pub label: &'static str,
+    /// Bytes the operation reads or writes.
+    pub bytes: u64,
+    /// Usages the buffer must have.
+    pub usage: wgpu::BufferUsages,
+}
+
+/// The buffers [`GpuPipelines::record_decode`] needs for one frame, in the
+/// order of [`DecodeBuffers`].
+///
+/// Each binding must start at a multiple of the device's
+/// `min_storage_buffer_offset_alignment`, and none may be larger than its
+/// `max_storage_buffer_binding_size`; the decode binds exactly `bytes` of
+/// each, so a larger region is fine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecodeFootprint {
+    /// Geometry and quantization matrix. Uploaded.
+    pub params: BufferRequest,
+    /// The packet, zero-padded. Uploaded.
+    pub packet: BufferRequest,
+    /// The table of component streams, sized for every tile being valid.
+    /// Uploaded.
+    pub streams: BufferRequest,
+    /// Dequantized coefficients: cleared and written by the stream pass,
+    /// read by the transform pass, dead after it (2 bytes per sensel).
+    pub coefs: BufferRequest,
+    /// One bit per 16×16 square of a skipped tile. Uploaded.
+    pub skipped: BufferRequest,
+    /// The output code values ([`sample_bytes`]), written by the transform
+    /// pass.
+    pub samples: BufferRequest,
+}
+
+impl DecodeFootprint {
+    /// The requests in [`DecodeBuffers`] order.
+    pub fn requests(&self) -> [BufferRequest; 6] {
+        [
+            self.params,
+            self.packet,
+            self.streams,
+            self.coefs,
+            self.skipped,
+            self.samples,
+        ]
     }
 
-    /// Decode the coefficients of `packet` and read them back, in the
-    /// scratch layout. For testing the stream pass on its own.
-    #[cfg(test)]
-    fn coefficients(
-        &mut self,
+    /// Total bytes of all requests.
+    pub fn bytes(&self) -> u64 {
+        self.requests().iter().map(|r| r.bytes).sum()
+    }
+}
+
+/// What a frame with `header` in a packet of `packet_len` bytes needs from
+/// the device to decode. The header comes from
+/// [`crate::parse_header`] on the start of the packet, so a frame can be
+/// planned before it is read in full.
+pub fn decode_footprint(header: &FrameHeader, packet_len: usize) -> DecodeFootprint {
+    use wgpu::BufferUsages as U;
+    let layout = Layout::new(header);
+    let tiles = crate::tile::TileGrid::new(
+        usize::from(header.width),
+        usize::from(header.height),
+        header.alignment,
+    )
+    .len();
+    let upload = U::STORAGE | U::COPY_DST;
+    let request = |label, bytes: u64, usage| BufferRequest {
+        label,
+        bytes: bytes.max(4).next_multiple_of(4),
+        usage,
+    };
+    DecodeFootprint {
+        params: request("prores raw params", PARAMS_WORDS * 4, upload),
+        // The upload ends with a padded word after the last whole one.
+        packet: request(
+            "prores raw packet",
+            ((packet_len & !3) + 4 + PACKET_PADDING) as u64,
+            upload,
+        ),
+        streams: request(
+            "prores raw streams",
+            (tiles * 4 * STREAM_WORDS * 4) as u64,
+            upload,
+        ),
+        coefs: request("prores raw coefficients", layout.coef_bytes(), upload),
+        skipped: request(
+            "prores raw skipped squares",
+            (layout.squares() as usize).div_ceil(32) as u64 * 4,
+            upload,
+        ),
+        samples: request("prores raw samples", layout.sample_bytes(), U::STORAGE),
+    }
+}
+
+/// Caller-provided buffers for [`GpuPipelines::record_decode`], one per
+/// [`DecodeFootprint`] request. Bindings may be regions of larger buffers,
+/// for example blocks of an arena.
+#[derive(Debug, Clone)]
+pub struct DecodeBuffers<'a> {
+    /// See [`DecodeFootprint::params`].
+    pub params: wgpu::BufferBinding<'a>,
+    /// See [`DecodeFootprint::packet`].
+    pub packet: wgpu::BufferBinding<'a>,
+    /// See [`DecodeFootprint::streams`].
+    pub streams: wgpu::BufferBinding<'a>,
+    /// See [`DecodeFootprint::coefs`].
+    pub coefs: wgpu::BufferBinding<'a>,
+    /// See [`DecodeFootprint::skipped`].
+    pub skipped: wgpu::BufferBinding<'a>,
+    /// See [`DecodeFootprint::samples`].
+    pub samples: wgpu::BufferBinding<'a>,
+}
+
+/// What [`GpuPipelines::record_decode`] learnt from the frame's headers.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DecodeInfo {
+    /// The frame header.
+    pub header: FrameHeader,
+    /// Indices of tiles skipped for an invalid header; their sensels are
+    /// not written.
+    pub skipped_tiles: Vec<usize>,
+    /// Largest qscale byte over all tiles, as in [`Frame::max_qscale`].
+    pub max_qscale: u8,
+}
+
+impl DecodeInfo {
+    /// The frame quantizer, as [`Frame::quantizer`] gives it.
+    pub fn quantizer(&self) -> u32 {
+        crate::decoder::quantizer(&self.header, self.max_qscale)
+    }
+}
+
+/// Check `binding` against `request` and return it narrowed to exactly
+/// the requested bytes.
+fn bind<'a>(
+    binding: &wgpu::BufferBinding<'a>,
+    request: &BufferRequest,
+    alignment: u32,
+) -> Result<wgpu::BufferBinding<'a>, GpuError> {
+    let what = request.label;
+    if !binding.buffer.usage().contains(request.usage) {
+        return Err(GpuError::MissingUsage {
+            what,
+            needs: request.usage,
+        });
+    }
+    let alignment = u64::from(alignment);
+    if binding.offset % alignment != 0 {
+        return Err(GpuError::Misaligned {
+            what,
+            offset: binding.offset,
+            alignment,
+        });
+    }
+    let rest = binding.buffer.size().saturating_sub(binding.offset);
+    let size = binding.size.map_or(rest, |s| s.get().min(rest));
+    if size < request.bytes {
+        return Err(GpuError::BufferTooSmall {
+            what,
+            size,
+            needed: request.bytes,
+        });
+    }
+    Ok(wgpu::BufferBinding {
+        buffer: binding.buffer,
+        offset: binding.offset,
+        size: wgpu::BufferSize::new(request.bytes),
+    })
+}
+
+/// Fail when any request exceeds the device's storage binding limits.
+fn check_limits(device: &wgpu::Device, requests: &[BufferRequest]) -> Result<(), GpuError> {
+    let limits = device.limits();
+    let limit = u64::from(limits.max_storage_buffer_binding_size).min(limits.max_buffer_size);
+    for r in requests {
+        if r.bytes > limit {
+            return Err(GpuError::TooLarge {
+                what: r.label,
+                bytes: r.bytes,
+                limit,
+            });
+        }
+    }
+    Ok(())
+}
+
+impl GpuPipelines {
+    /// Record the decode of `packet` into `encoder`, reading and writing
+    /// only `buffers` (see [`decode_footprint`]). Nothing is submitted, so
+    /// a consumer can chain further passes in the same submission; the
+    /// code values are in `buffers.samples` once it completes.
+    ///
+    /// The host parses and validates the headers here and uploads the
+    /// packet, the stream table, the parameters and the skipped-square
+    /// bitmap with `queue.write_buffer`. wgpu performs such writes before
+    /// the commands of the next submission on `queue`, so decodes recorded
+    /// into one submission need separate upload buffers; the coefficients
+    /// and the output may be reused once the transform pass has run.
+    pub fn record_decode(
+        &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
         packet: &[u8],
-    ) -> Result<Vec<u32>, GpuError> {
+        buffers: &DecodeBuffers<'_>,
+    ) -> Result<DecodeInfo, GpuError> {
         let parsed = parse_frame(packet)?;
-        let dummy = device.create_buffer(&wgpu::BufferDescriptor {
-            label: None,
-            size: 4,
-            usage: wgpu::BufferUsages::STORAGE,
-            mapped_at_creation: false,
+        let footprint = decode_footprint(&parsed.header, packet.len());
+        // Stream offsets are addressed in bits with 32-bit arithmetic.
+        let bit_limit = u64::from(u32::MAX / 8);
+        if footprint.packet.bytes > bit_limit {
+            return Err(GpuError::TooLarge {
+                what: "packet",
+                bytes: footprint.packet.bytes,
+                limit: bit_limit,
+            });
+        }
+        check_limits(device, &footprint.requests())?;
+        let alignment = device.limits().min_storage_buffer_offset_alignment;
+        let b = |binding, request| bind(binding, request, alignment);
+        let params_b = b(&buffers.params, &footprint.params)?;
+        let packet_b = b(&buffers.packet, &footprint.packet)?;
+        let streams_b = b(&buffers.streams, &footprint.streams)?;
+        let coefs_b = b(&buffers.coefs, &footprint.coefs)?;
+        let skipped_b = b(&buffers.skipped, &footprint.skipped)?;
+        let samples_b = b(&buffers.samples, &footprint.samples)?;
+
+        let layout = Layout::new(&parsed.header);
+        let mut skipped_tiles = Vec::new();
+        let (table, skipped_squares) = stream_table(packet, &parsed, &layout, &mut skipped_tiles);
+        let streams = (table.len() / STREAM_WORDS) as u32;
+        let params = params(&parsed.header, &layout, streams);
+        queue.write_buffer(params_b.buffer, params_b.offset, &words_to_bytes(&params));
+        if !table.is_empty() {
+            queue.write_buffer(streams_b.buffer, streams_b.offset, &words_to_bytes(&table));
+        }
+        upload_padded(queue, packet_b.buffer, packet_b.offset, packet);
+        queue.write_buffer(
+            skipped_b.buffer,
+            skipped_b.offset,
+            &words_to_bytes(&skipped_squares),
+        );
+
+        let (coefs_buffer, coefs_offset) = (coefs_b.buffer, coefs_b.offset);
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("prores raw frame"),
+            layout: &self.decode_layout,
+            entries: &[
+                binding_entry(0, params_b),
+                binding_entry(1, packet_b),
+                binding_entry(2, streams_b),
+                binding_entry(3, coefs_b),
+                binding_entry(4, samples_b),
+                binding_entry(5, skipped_b),
+            ],
         });
-        let (encoder, _, layout) = self.record_streams(device, queue, packet, &parsed, &dummy)?;
-        queue.submit([encoder.finish()]);
-        let coefs = self
-            .coefs
-            .buffer
-            .as_ref()
-            .expect("allocated by record_streams");
-        let bytes = read_buffer(device, queue, coefs, layout.coef_bytes())?;
-        Ok(bytes
-            .chunks_exact(4)
-            .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
-            .collect())
+        // The stream pass ORs coefficients into zeroed words; one fill is
+        // much cheaper than each invocation zeroing its scattered blocks.
+        encoder.clear_buffer(coefs_buffer, coefs_offset, Some(footprint.coefs.bytes));
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("prores raw decode"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.decode_streams);
+            pass.set_bind_group(0, &bind_group, &[]);
+            let (x, y) = groups(
+                streams,
+                device.limits().max_compute_workgroups_per_dimension,
+            );
+            pass.dispatch_workgroups(x, y, 1);
+            pass.set_pipeline(&self.transform);
+            pass.dispatch_workgroups(layout.squares_x, layout.squares_y, 1);
+        }
+        Ok(DecodeInfo {
+            header: parsed.header,
+            skipped_tiles,
+            max_qscale: parsed.max_qscale,
+        })
     }
 }
 
@@ -637,6 +856,13 @@ fn entry(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
     }
 }
 
+fn binding_entry(binding: u32, buffer: wgpu::BufferBinding<'_>) -> wgpu::BindGroupEntry<'_> {
+    wgpu::BindGroupEntry {
+        binding,
+        resource: wgpu::BindingResource::Buffer(buffer),
+    }
+}
+
 /// Workgroup counts covering `streams` invocations within the per-dimension limit.
 fn groups(streams: u32, max_per_dimension: u32) -> (u32, u32) {
     let total = streams.div_ceil(STREAM_GROUP).max(1);
@@ -651,15 +877,15 @@ fn words_to_bytes(words: &[u32]) -> Vec<u8> {
 /// Write `data` to the start of `buffer` followed by zero padding, without
 /// copying the bulk of it: the aligned prefix goes directly, the tail and
 /// padding through a small array.
-fn upload_padded(queue: &wgpu::Queue, buffer: &wgpu::Buffer, data: &[u8]) {
+fn upload_padded(queue: &wgpu::Queue, buffer: &wgpu::Buffer, offset: u64, data: &[u8]) {
     let aligned = data.len() & !3;
     if aligned > 0 {
-        queue.write_buffer(buffer, 0, &data[..aligned]);
+        queue.write_buffer(buffer, offset, &data[..aligned]);
     }
     let mut tail = [0u8; 4 + PACKET_PADDING];
     let rest = &data[aligned..];
     tail[..rest.len()].copy_from_slice(rest);
-    queue.write_buffer(buffer, aligned as u64, &tail);
+    queue.write_buffer(buffer, offset + aligned as u64, &tail);
 }
 
 /// Copy `size` bytes of `src` to the host.
@@ -795,16 +1021,67 @@ mod tests {
         words
     }
 
+    /// Buffers for every request of `footprint`, the coefficients
+    /// readable.
+    fn allocate(device: &wgpu::Device, footprint: &DecodeFootprint) -> Vec<wgpu::Buffer> {
+        footprint
+            .requests()
+            .iter()
+            .map(|r| {
+                device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some(r.label),
+                    size: r.bytes,
+                    usage: r.usage | wgpu::BufferUsages::COPY_SRC,
+                    mapped_at_creation: false,
+                })
+            })
+            .collect()
+    }
+
+    fn buffers(b: &[wgpu::Buffer]) -> DecodeBuffers<'_> {
+        DecodeBuffers {
+            params: b[0].as_entire_buffer_binding(),
+            packet: b[1].as_entire_buffer_binding(),
+            streams: b[2].as_entire_buffer_binding(),
+            coefs: b[3].as_entire_buffer_binding(),
+            skipped: b[4].as_entire_buffer_binding(),
+            samples: b[5].as_entire_buffer_binding(),
+        }
+    }
+
+    /// Decode `packet` into buffers of its footprint and read back the
+    /// coefficients, which the transform pass leaves in place.
+    fn gpu_coefficients(
+        pipelines: &GpuPipelines,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        packet: &[u8],
+    ) -> Vec<u32> {
+        let header = crate::parse_header(packet).unwrap();
+        let footprint = decode_footprint(&header, packet.len());
+        let b = allocate(device, &footprint);
+        let mut encoder = device.create_command_encoder(&Default::default());
+        pipelines
+            .record_decode(device, queue, &mut encoder, packet, &buffers(&b))
+            .unwrap();
+        queue.submit([encoder.finish()]);
+        read_buffer(device, queue, &b[3], footprint.coefs.bytes)
+            .unwrap()
+            .chunks_exact(4)
+            .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+            .collect()
+    }
+
     #[test]
     fn stream_pass_matches_the_host() {
         let Some((device, queue)) = device() else {
             return;
         };
-        let mut decoder = GpuDecoder::new(&device);
+        let pipelines = GpuPipelines::new(&device);
         let mut rng = Rng::new(7);
         for spec in specs(&mut rng) {
             let packet = random_frame(&spec, &mut rng);
-            let gpu = decoder.coefficients(&device, &queue, &packet).unwrap();
+            let gpu = gpu_coefficients(&pipelines, &device, &queue, &packet);
             let host = host_coefficients(&packet);
             let first_diff = gpu.iter().zip(&host).position(|(a, b)| a != b);
             assert_eq!(
@@ -845,6 +1122,96 @@ mod tests {
         assert_eq!(differ, 0);
     }
 
+    /// Every request of a footprint as a region of one shared buffer, the
+    /// way an arena hands out blocks: decodes recorded into one encoder,
+    /// each with its own regions, match the host.
+    #[test]
+    fn record_decode_into_regions_of_one_buffer() {
+        let Some((device, queue)) = device() else {
+            return;
+        };
+        let pipelines = GpuPipelines::new(&device);
+        let align = u64::from(device.limits().min_storage_buffer_offset_alignment);
+        let mut rng = Rng::new(31);
+        let packets: Vec<Vec<u8>> = specs(&mut rng)
+            .into_iter()
+            .take(3)
+            .map(|spec| random_frame(&spec, &mut rng))
+            .collect();
+        // Lay out every request of every frame, aligned.
+        let mut offsets = Vec::new();
+        let mut end = 0u64;
+        for packet in &packets {
+            let footprint = decode_footprint(&crate::parse_header(packet).unwrap(), packet.len());
+            let frame: Vec<u64> = footprint
+                .requests()
+                .iter()
+                .map(|r| {
+                    let at = end.next_multiple_of(align);
+                    end = at + r.bytes;
+                    at
+                })
+                .collect();
+            offsets.push((footprint, frame));
+        }
+        let arena = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("arena"),
+            size: end.next_multiple_of(4),
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let region = |at: u64, bytes: u64| wgpu::BufferBinding {
+            buffer: &arena,
+            offset: at,
+            size: wgpu::BufferSize::new(bytes),
+        };
+        let mut encoder = device.create_command_encoder(&Default::default());
+        for (packet, (footprint, at)) in packets.iter().zip(&offsets) {
+            let r = footprint.requests();
+            let buffers = DecodeBuffers {
+                params: region(at[0], r[0].bytes),
+                packet: region(at[1], r[1].bytes),
+                streams: region(at[2], r[2].bytes),
+                coefs: region(at[3], r[3].bytes),
+                skipped: region(at[4], r[4].bytes),
+                samples: region(at[5], r[5].bytes),
+            };
+            pipelines
+                .record_decode(&device, &queue, &mut encoder, packet, &buffers)
+                .unwrap();
+        }
+        queue.submit([encoder.finish()]);
+        let all = read_buffer(&device, &queue, &arena, arena.size()).unwrap();
+        for (packet, (footprint, at)) in packets.iter().zip(&offsets) {
+            let host = crate::decode_frame(packet).unwrap();
+            let bytes = &all[at[5] as usize..(at[5] + footprint.samples.bytes) as usize];
+            let gpu: Vec<u16> = bytes
+                .chunks_exact(2)
+                .map(|h| u16::from_le_bytes([h[0], h[1]]))
+                .collect();
+            assert_eq!(gpu, host.samples);
+        }
+
+        // A region off the device's alignment is refused.
+        let (footprint, at) = &offsets[0];
+        let r = footprint.requests();
+        let shifted = DecodeBuffers {
+            params: region(at[0], r[0].bytes),
+            packet: region(at[1], r[1].bytes),
+            streams: region(at[2], r[2].bytes),
+            coefs: region(at[3] + 4, r[3].bytes),
+            skipped: region(at[4], r[4].bytes),
+            samples: region(at[5], r[5].bytes),
+        };
+        let mut encoder = device.create_command_encoder(&Default::default());
+        assert!(matches!(
+            pipelines.record_decode(&device, &queue, &mut encoder, &packets[0], &shifted),
+            Err(GpuError::Misaligned { .. })
+        ));
+    }
+
     #[test]
     fn decode_into_checks_the_output_buffer() {
         let Some((device, queue)) = device() else {
@@ -866,12 +1233,12 @@ mod tests {
         let small = buffer(needed - 4, wgpu::BufferUsages::STORAGE);
         assert!(matches!(
             decoder.decode_into(&device, &queue, &packet, &small),
-            Err(GpuError::OutputTooSmall { .. })
+            Err(GpuError::BufferTooSmall { .. })
         ));
         let copy_only = buffer(needed, wgpu::BufferUsages::COPY_DST);
         assert!(matches!(
             decoder.decode_into(&device, &queue, &packet, &copy_only),
-            Err(GpuError::OutputNotStorage)
+            Err(GpuError::MissingUsage { .. })
         ));
         let fine = buffer(needed, wgpu::BufferUsages::STORAGE);
         assert!(decoder.decode_into(&device, &queue, &packet, &fine).is_ok());

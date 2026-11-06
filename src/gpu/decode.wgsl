@@ -30,10 +30,12 @@ struct Stream {
     info: u32,
 }
 
-@group(0) @binding(0) var<storage, read> params: Params;
+// Bindings the passes only read are declared read_write too, so that a
+// caller may place every buffer in one (see `GpuPipelines::new`).
+@group(0) @binding(0) var<storage, read_write> params: Params;
 // The packet, four bytes per word in memory order, padded with zeros.
-@group(0) @binding(1) var<storage, read> packet: array<u32>;
-@group(0) @binding(2) var<storage, read> streams: array<Stream>;
+@group(0) @binding(1) var<storage, read_write> packet: array<u32>;
+@group(0) @binding(2) var<storage, read_write> streams: array<Stream>;
 // Per square: four streams of 64 coefficients, two 16-bit values per word,
 // the even raster index in the low half. Cleared before the stream pass.
 @group(0) @binding(3) var<storage, read_write> coefs: array<u32>;
@@ -43,7 +45,7 @@ struct Stream {
 // Code values, two per word, the even column in the low half.
 @group(0) @binding(4) var<storage, read_write> samples: array<u32>;
 // One bit per square: set when its tile was skipped for an invalid header.
-@group(0) @binding(5) var<storage, read> skipped: array<u32>;
+@group(0) @binding(5) var<storage, read_write> skipped: array<u32>;
 
 // TABLES
 
