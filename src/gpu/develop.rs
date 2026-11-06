@@ -1,8 +1,8 @@
 //! The raw conversion on the GPU: [`crate::develop_planar`], pass for pass.
 
 use super::{
-    BufferRequest, GpuError, GpuFrame, GpuPipelines, Slot, bind, binding_entry, check_limits,
-    read_buffers_with, sample_bytes,
+    BufferRequest, GpuError, GpuFrame, GpuPipelines, Slot, Upload, bind, binding_entry,
+    check_limits, read_buffers_with, record_uploads, sample_bytes,
 };
 use crate::decoder::Frame;
 use crate::demosaic::{Conversion, DemosaicParams, RgbPlanes, Stage};
@@ -383,7 +383,6 @@ impl GpuDeveloper {
         });
         self.pipelines.record_develop(
             device,
-            queue,
             &mut encoder,
             header,
             params,
@@ -534,11 +533,11 @@ impl GpuPipelines {
     /// submission completes. The values are [`crate::develop_planar`]'s,
     /// bit for bit.
     ///
-    /// The parameters and the table are uploaded with `queue.write_buffer`,
-    /// which wgpu performs before the commands of the next submission, so
-    /// conversions recorded into one submission need separate upload
-    /// buffers. The code values may come from a decode recorded earlier in
-    /// the same encoder.
+    /// The parameters and the table are uploaded by copies recorded into
+    /// `encoder`, so they land in recording order: conversions recorded
+    /// one after another into one submission may share every buffer but
+    /// their outputs. The code values may come from a decode recorded
+    /// earlier in the same encoder.
     ///
     /// The conversion runs in bands of `band_rows` rows, all recorded here,
     /// one after another through the same green-pass planes, so those hold
@@ -551,7 +550,6 @@ impl GpuPipelines {
     pub fn record_develop(
         &self,
         device: &wgpu::Device,
-        queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
         header: &FrameHeader,
         params: &DemosaicParams,
@@ -597,15 +595,21 @@ impl GpuPipelines {
             blocks[at..at + PARAMS_BYTES].copy_from_slice(&block);
             dispatches.push((rows as u32, g_rows as u32));
         }
-        queue.write_buffer(params_b.buffer, params_b.offset, &blocks);
-        // Each band binds its own block through a dynamic offset.
-        params_b.size = wgpu::BufferSize::new(PARAMS_BYTES as u64);
         let lut: Vec<u8> = conversion
             .lut
             .iter()
             .flat_map(|v| v.to_le_bytes())
             .collect();
-        queue.write_buffer(lut_b.buffer, lut_b.offset, &lut);
+        record_uploads(
+            device,
+            encoder,
+            &[
+                Upload::new(&params_b, &[&blocks]),
+                Upload::new(&lut_b, &[&lut]),
+            ],
+        );
+        // Each band binds its own block through a dynamic offset.
+        params_b.size = wgpu::BufferSize::new(PARAMS_BYTES as u64);
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("prores raw develop frame"),
             layout: &self.develop.layout,
@@ -780,6 +784,80 @@ mod tests {
         }
     }
 
+    /// Two conversions of one frame recorded into one submission through
+    /// the same parameter, table and green buffers, at different stages:
+    /// each must see its own uploads.
+    #[test]
+    fn conversions_in_one_submission_may_share_scratch() {
+        let Some((device, queue)) = device() else {
+            return;
+        };
+        let mut decoder = GpuDecoder::new(&device);
+        let pipelines = decoder.pipelines().clone();
+        let mut rng = Rng::new(28);
+        let spec = Spec {
+            valid_tiles: true,
+            wb: (2.1, 1.3),
+            ..Spec::new(96, 48, crate::BayerPattern::Bggr)
+        };
+        let packet = random_frame(&spec, &mut rng);
+        let frame = decoder.decode(&device, &queue, &packet).unwrap();
+        let host_frame = crate::decode_frame(&packet).unwrap();
+        let params = DemosaicParams::new(&frame.header, frame.quantizer());
+        let limits = device.limits();
+        let footprint = develop_footprint(&frame.header, 16, &limits);
+        let alloc = |r: BufferRequest| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(r.label),
+                size: r.bytes,
+                usage: r.usage | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            })
+        };
+        let shared = [footprint.params, footprint.lut, footprint.rb, footprint.gr].map(alloc);
+        let stages = [Stage::Demosaiced, Stage::Rec2020];
+        let outputs = stages.map(|_| [footprint.red, footprint.green, footprint.blue].map(alloc));
+        let mut encoder = device.create_command_encoder(&Default::default());
+        for (stage, out) in stages.iter().zip(&outputs) {
+            let buffers = DevelopBuffers {
+                params: shared[0].as_entire_buffer_binding(),
+                lut: shared[1].as_entire_buffer_binding(),
+                samples: frame.samples.as_entire_buffer_binding(),
+                rb: shared[2].as_entire_buffer_binding(),
+                gr: shared[3].as_entire_buffer_binding(),
+                red: out[0].as_entire_buffer_binding(),
+                green: out[1].as_entire_buffer_binding(),
+                blue: out[2].as_entire_buffer_binding(),
+            };
+            pipelines
+                .record_develop(
+                    &device,
+                    &mut encoder,
+                    &frame.header,
+                    &params,
+                    *stage,
+                    16,
+                    &buffers,
+                )
+                .unwrap();
+        }
+        queue.submit([encoder.finish()]);
+        for (stage, out) in stages.iter().zip(&outputs) {
+            let host = crate::develop_planar(&host_frame, &params, *stage);
+            let [r, g, b] = out;
+            let size = footprint.red.bytes;
+            let planes = crate::gpu::read_buffers(&device, &queue, &[r, g, b], size).unwrap();
+            for (c, plane) in planes.iter().enumerate() {
+                let gpu: Vec<u32> = plane
+                    .chunks_exact(4)
+                    .map(|v| u32::from_le_bytes([v[0], v[1], v[2], v[3]]))
+                    .collect();
+                let want: Vec<u32> = host.planes[c].iter().map(|v| v.to_bits()).collect();
+                assert!(gpu == want, "{stage:?} channel {c} differs from the host");
+            }
+        }
+    }
+
     #[test]
     fn bands_size_the_scratch() {
         let mut rng = Rng::new(26);
@@ -932,7 +1010,7 @@ mod tests {
             samples: region(d[5]),
         };
         let info = pipelines
-            .record_decode(&device, &queue, &mut encoder, &packet, &decode_buffers)
+            .record_decode(&device, &mut encoder, &packet, &decode_buffers)
             .unwrap();
         let params = DemosaicParams::new(&info.header, info.quantizer());
         let develop_buffers = DevelopBuffers {
@@ -948,7 +1026,6 @@ mod tests {
         pipelines
             .record_develop(
                 &device,
-                &queue,
                 &mut encoder,
                 &info.header,
                 &params,

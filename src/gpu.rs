@@ -39,9 +39,9 @@
 //!    block is a uniform and needs a buffer of its own.
 //! 3. Record: [`GpuPipelines::record_decode`], then
 //!    [`GpuPipelines::record_develop`] on its output, into one encoder,
-//!    and submit when you choose. Uploads go through `queue.write_buffer`,
-//!    which lands before the commands of the next submission, so frames
-//!    recorded into one submission need their own upload buffers.
+//!    and submit when you choose. Uploads are copies recorded into the
+//!    encoder, so they land in recording order: several frames recorded
+//!    into one submission may reuse the same scratch buffers.
 //!
 //! The conversion runs in row bands, so its green-pass scratch is
 //! [`develop_row_bytes`] per row of a band plus [`DEVELOP_GREEN_HALO`]
@@ -465,7 +465,7 @@ impl GpuDecoder {
         });
         let info = self
             .pipelines
-            .record_decode(device, queue, &mut encoder, packet, &buffers)?;
+            .record_decode(device, &mut encoder, packet, &buffers)?;
         queue.submit([encoder.finish()]);
         self.skipped_tiles.clone_from(&info.skipped_tiles);
         self.max_qscale = info.max_qscale;
@@ -685,16 +685,15 @@ impl GpuPipelines {
     /// a consumer can chain further passes in the same submission; the
     /// code values are in `buffers.samples` once it completes.
     ///
-    /// The host parses and validates the headers here and uploads the
-    /// packet, the stream table, the parameters and the skipped-square
-    /// bitmap with `queue.write_buffer`. wgpu performs such writes before
-    /// the commands of the next submission on `queue`, so decodes recorded
-    /// into one submission need separate upload buffers; the coefficients
-    /// and the output may be reused once the transform pass has run.
+    /// The host parses and validates the headers here. The packet, the
+    /// stream table, the parameters and the skipped-square bitmap are
+    /// uploaded by copies recorded into `encoder`, from a staging buffer
+    /// that lives until the submission completes, so they land in
+    /// recording order: frames recorded one after another into one
+    /// submission may share every buffer but their outputs.
     pub fn record_decode(
         &self,
         device: &wgpu::Device,
-        queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
         packet: &[u8],
         buffers: &DecodeBuffers<'_>,
@@ -724,16 +723,23 @@ impl GpuPipelines {
         let mut skipped_tiles = Vec::new();
         let (table, skipped_squares) = stream_table(packet, &parsed, &layout, &mut skipped_tiles);
         let streams = (table.len() / STREAM_WORDS) as u32;
-        let params = params(&parsed.header, &layout, streams);
-        queue.write_buffer(params_b.buffer, params_b.offset, &words_to_bytes(&params));
-        if !table.is_empty() {
-            queue.write_buffer(streams_b.buffer, streams_b.offset, &words_to_bytes(&table));
-        }
-        upload_padded(queue, packet_b.buffer, packet_b.offset, packet);
-        queue.write_buffer(
-            skipped_b.buffer,
-            skipped_b.offset,
-            &words_to_bytes(&skipped_squares),
+        let params = words_to_bytes(&params(&parsed.header, &layout, streams));
+        let table = words_to_bytes(&table);
+        let skipped_squares = words_to_bytes(&skipped_squares);
+        record_uploads(
+            device,
+            encoder,
+            &[
+                Upload::new(&params_b, &[&params]),
+                Upload::new(&streams_b, &[&table]),
+                // Zero-filled to the request: the padding the stream reader
+                // may look at past the end.
+                Upload {
+                    size: footprint.packet.bytes,
+                    ..Upload::new(&packet_b, &[packet])
+                },
+                Upload::new(&skipped_b, &[&skipped_squares]),
+            ],
         );
 
         let (coefs_buffer, coefs_offset) = (coefs_b.buffer, coefs_b.offset);
@@ -915,18 +921,70 @@ fn words_to_bytes(words: &[u32]) -> Vec<u8> {
     words.iter().flat_map(|w| w.to_le_bytes()).collect()
 }
 
-/// Write `data` to the start of `buffer` followed by zero padding, without
-/// copying the bulk of it: the aligned prefix goes directly, the tail and
-/// padding through a small array.
-fn upload_padded(queue: &wgpu::Queue, buffer: &wgpu::Buffer, offset: u64, data: &[u8]) {
-    let aligned = data.len() & !3;
-    if aligned > 0 {
-        queue.write_buffer(buffer, offset, &data[..aligned]);
+/// Bytes to copy into a buffer region: `parts` one after another, then
+/// zeros up to `size`.
+struct Upload<'a> {
+    buffer: &'a wgpu::Buffer,
+    offset: u64,
+    parts: &'a [&'a [u8]],
+    /// A multiple of 4, at least the parts' total length.
+    size: u64,
+}
+
+impl<'a> Upload<'a> {
+    /// `parts` into the start of `binding`, rounded up to whole words.
+    fn new(binding: &wgpu::BufferBinding<'a>, parts: &'a [&'a [u8]]) -> Self {
+        let len: usize = parts.iter().map(|p| p.len()).sum();
+        Upload {
+            buffer: binding.buffer,
+            offset: binding.offset,
+            parts,
+            size: (len as u64).next_multiple_of(4),
+        }
     }
-    let mut tail = [0u8; 4 + PACKET_PADDING];
-    let rest = &data[aligned..];
-    tail[..rest.len()].copy_from_slice(rest);
-    queue.write_buffer(buffer, offset + aligned as u64, &tail);
+}
+
+/// Write `uploads` into one new staging buffer and record their copies
+/// into `encoder`, so that they land in recording order, between the
+/// commands recorded before and after, unlike `queue.write_buffer`, which
+/// lands before the whole next submission. wgpu keeps the staging buffer
+/// alive until the submission has run.
+fn record_uploads(
+    device: &wgpu::Device,
+    encoder: &mut wgpu::CommandEncoder,
+    uploads: &[Upload<'_>],
+) {
+    let total: u64 = uploads.iter().map(|u| u.size).sum();
+    if total == 0 {
+        return;
+    }
+    let staging = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("prores raw upload"),
+        size: total,
+        usage: wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: true,
+    });
+    {
+        // A buffer mapped at creation starts zeroed, which pads each upload.
+        let mut view = staging.slice(..).get_mapped_range_mut();
+        let mut at = 0usize;
+        for upload in uploads {
+            let mut pos = at;
+            for part in upload.parts {
+                view[pos..pos + part.len()].copy_from_slice(part);
+                pos += part.len();
+            }
+            at += upload.size as usize;
+        }
+    }
+    staging.unmap();
+    let mut at = 0;
+    for upload in uploads {
+        if upload.size > 0 {
+            encoder.copy_buffer_to_buffer(&staging, at, upload.buffer, upload.offset, upload.size);
+        }
+        at += upload.size;
+    }
 }
 
 /// Copy `size` bytes of `src` to the host.
@@ -1011,7 +1069,7 @@ mod tests {
     use super::*;
     use crate::coefficients::decode_component;
     use crate::idct::dequantize;
-    use crate::synth::{Rng, random_frame, specs};
+    use crate::synth::{Rng, Spec, random_frame, specs};
 
     /// A device, or `None` with a message when the machine has no adapter.
     pub(crate) fn device() -> Option<(wgpu::Device, wgpu::Queue)> {
@@ -1103,7 +1161,7 @@ mod tests {
         let b = allocate(device, &footprint);
         let mut encoder = device.create_command_encoder(&Default::default());
         pipelines
-            .record_decode(device, queue, &mut encoder, packet, &buffers(&b))
+            .record_decode(device, &mut encoder, packet, &buffers(&b))
             .unwrap();
         queue.submit([encoder.finish()]);
         read_buffer(device, queue, &b[3], footprint.coefs.bytes)
@@ -1220,7 +1278,7 @@ mod tests {
                 samples: region(at[5], r[5].bytes),
             };
             pipelines
-                .record_decode(&device, &queue, &mut encoder, packet, &buffers)
+                .record_decode(&device, &mut encoder, packet, &buffers)
                 .unwrap();
         }
         queue.submit([encoder.finish()]);
@@ -1248,9 +1306,77 @@ mod tests {
         };
         let mut encoder = device.create_command_encoder(&Default::default());
         assert!(matches!(
-            pipelines.record_decode(&device, &queue, &mut encoder, &packets[0], &shifted),
+            pipelines.record_decode(&device, &mut encoder, &packets[0], &shifted),
             Err(GpuError::Misaligned { .. })
         ));
+    }
+
+    /// Two frames recorded into one submission through the same scratch
+    /// buffers, uploads included, each into its own output: the uploads
+    /// must land in recording order for both to come out right.
+    #[test]
+    fn decodes_in_one_submission_may_share_scratch() {
+        let Some((device, queue)) = device() else {
+            return;
+        };
+        let pipelines = GpuPipelines::new(&device);
+        let mut rng = Rng::new(33);
+        let spec = Spec::new(128, 64, crate::BayerPattern::Rggb);
+        let packets = [random_frame(&spec, &mut rng), random_frame(&spec, &mut rng)];
+        let footprints = packets
+            .each_ref()
+            .map(|p| decode_footprint(&crate::parse_header(p).unwrap(), p.len()));
+        // Scratch sized for the larger of the two, shared.
+        let largest = |i: usize| {
+            footprints
+                .iter()
+                .map(|f| f.requests()[i])
+                .max_by_key(|r| r.bytes)
+                .unwrap()
+        };
+        let scratch: Vec<wgpu::Buffer> = (0..5)
+            .map(|i| {
+                let r = largest(i);
+                device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some(r.label),
+                    size: r.bytes,
+                    usage: r.usage,
+                    mapped_at_creation: false,
+                })
+            })
+            .collect();
+        let outputs = footprints.map(|f| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("samples"),
+                size: f.samples.bytes,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            })
+        });
+        let mut encoder = device.create_command_encoder(&Default::default());
+        for (packet, out) in packets.iter().zip(&outputs) {
+            let buffers = DecodeBuffers {
+                params: scratch[0].as_entire_buffer_binding(),
+                packet: scratch[1].as_entire_buffer_binding(),
+                streams: scratch[2].as_entire_buffer_binding(),
+                coefs: scratch[3].as_entire_buffer_binding(),
+                skipped: scratch[4].as_entire_buffer_binding(),
+                samples: out.as_entire_buffer_binding(),
+            };
+            pipelines
+                .record_decode(&device, &mut encoder, packet, &buffers)
+                .unwrap();
+        }
+        queue.submit([encoder.finish()]);
+        for (i, (packet, out)) in packets.iter().zip(&outputs).enumerate() {
+            let host = crate::decode_frame(packet).unwrap();
+            let bytes = read_buffer(&device, &queue, out, out.size()).unwrap();
+            let gpu: Vec<u16> = bytes
+                .chunks_exact(2)
+                .map(|h| u16::from_le_bytes([h[0], h[1]]))
+                .collect();
+            assert!(gpu == host.samples, "frame {i} differs from the host");
+        }
     }
 
     #[test]

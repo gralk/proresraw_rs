@@ -345,9 +345,11 @@ them instead:
   green row) describe the conversion's needs; `gpu::default_band_rows`
   is what a standalone caller gets.
 
-Uploads use `queue.write_buffer`, which wgpu performs before the next
-submission's commands: frames recorded into one submission need their
-own upload buffers. Readback is the caller's, from buffers it owns;
+Uploads (packet, stream table, parameters, the conversion's table) are
+copies recorded into the caller's encoder from a transient staging
+buffer, so they land in recording order: several frames recorded into
+one submission may reuse the same scratch buffers. Readback is the
+caller's, from buffers it owns;
 `GpuFrame::download` and `GpuRgb::download` remain for simple use, and
 `release` frees a wrapper's scratch.
 
