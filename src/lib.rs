@@ -58,7 +58,7 @@ pub use demosaic::{
 };
 pub use error::{Error, Result};
 #[cfg(feature = "gpu")]
-pub use gpu::{GpuDecoder, GpuDeveloper, GpuError, GpuFrame, GpuRgb};
+pub use gpu::{GpuDecoder, GpuDeveloper, GpuError, GpuFrame, GpuPipelines, GpuRgb};
 pub use header::{BLACK_LEVEL, BayerPattern, Color, Crop, FrameHeader};
 pub use idct::Idct;
 pub use reduced::{Greens, RgbFrame, Scale, decode_frame_reduced, decode_frame_reduced_with};

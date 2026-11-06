@@ -23,6 +23,7 @@
 //! ([`GpuRgb`]) that stay on the GPU until downloaded.
 
 use std::fmt;
+use std::sync::Arc;
 
 mod develop;
 
@@ -197,9 +198,7 @@ impl Slot {
 /// decoder per thread. Frames decoded in a row on the same queue are
 /// ordered, so scratch reuse is safe without waiting.
 pub struct GpuDecoder {
-    layout: wgpu::BindGroupLayout,
-    decode_streams: wgpu::ComputePipeline,
-    transform: wgpu::ComputePipeline,
+    pipelines: Arc<GpuPipelines>,
     params: Slot,
     packet: Slot,
     streams: Slot,
@@ -209,8 +208,21 @@ pub struct GpuDecoder {
     max_qscale: u8,
 }
 
-impl GpuDecoder {
-    /// Compile the decoding pipelines for `device`.
+/// The compiled compute pipelines of the decoder and the raw conversion
+/// for one device.
+///
+/// Compiling them is the expensive part of setting up GPU work; share one
+/// set (behind an [`Arc`]) between every [`GpuDecoder`] and
+/// [`GpuDeveloper`] on the device. They hold no per-frame state.
+pub struct GpuPipelines {
+    decode_layout: wgpu::BindGroupLayout,
+    decode_streams: wgpu::ComputePipeline,
+    transform: wgpu::ComputePipeline,
+    develop: develop::Pipelines,
+}
+
+impl GpuPipelines {
+    /// Compile the decoding and conversion pipelines for `device`.
     pub fn new(device: &wgpu::Device) -> Self {
         let storage = |binding, read_only| wgpu::BindGroupLayoutEntry {
             binding,
@@ -253,11 +265,29 @@ impl GpuDecoder {
                 cache: None,
             })
         };
-        let copy_storage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
-        GpuDecoder {
+        GpuPipelines {
             decode_streams: pipeline("decode_streams"),
             transform: pipeline("transform"),
-            layout,
+            decode_layout: layout,
+            develop: develop::Pipelines::new(device),
+        }
+    }
+}
+
+impl GpuDecoder {
+    /// A decoder with its own pipelines, compiled for `device`. Prefer
+    /// [`GpuDecoder::with_pipelines`] when several decoders or a
+    /// [`GpuDeveloper`] share the device.
+    pub fn new(device: &wgpu::Device) -> Self {
+        Self::with_pipelines(Arc::new(GpuPipelines::new(device)))
+    }
+
+    /// A decoder using shared pipelines. Scratch buffers are allocated on
+    /// the pipelines' device when the first frame is decoded.
+    pub fn with_pipelines(pipelines: Arc<GpuPipelines>) -> Self {
+        let copy_storage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
+        GpuDecoder {
+            pipelines,
             params: Slot::new("prores raw params", copy_storage),
             packet: Slot::new("prores raw packet", copy_storage),
             streams: Slot::new("prores raw streams", copy_storage),
@@ -301,6 +331,11 @@ impl GpuDecoder {
     /// [`Frame::max_qscale`]).
     pub fn max_qscale(&self) -> u8 {
         self.max_qscale
+    }
+
+    /// The pipelines this decoder runs.
+    pub fn pipelines(&self) -> &Arc<GpuPipelines> {
+        &self.pipelines
     }
 
     /// Indices of the tiles of the most recently submitted frame that were
@@ -348,7 +383,7 @@ impl GpuDecoder {
                 label: Some("prores raw transform"),
                 timestamp_writes: None,
             });
-            pass.set_pipeline(&self.transform);
+            pass.set_pipeline(&self.pipelines.transform);
             pass.set_bind_group(0, &bind_group, &[]);
             pass.dispatch_workgroups(layout.squares_x, layout.squares_y, 1);
         }
@@ -410,7 +445,7 @@ impl GpuDecoder {
 
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("prores raw frame"),
-            layout: &self.layout,
+            layout: &self.pipelines.decode_layout,
             entries: &[
                 entry(0, params_buf),
                 entry(1, packet_buf),
@@ -431,7 +466,7 @@ impl GpuDecoder {
                 label: Some("prores raw streams"),
                 timestamp_writes: None,
             });
-            pass.set_pipeline(&self.decode_streams);
+            pass.set_pipeline(&self.pipelines.decode_streams);
             pass.set_bind_group(0, &bind_group, &[]);
             let (x, y) = groups(
                 (table.len() / STREAM_WORDS) as u32,
@@ -844,6 +879,14 @@ mod tests {
             decoder.decode_into(&device, &queue, &packet[..20], &fine),
             Err(GpuError::Format(_))
         ));
+    }
+
+    #[test]
+    fn gpu_types_can_be_shared_between_threads() {
+        fn check<T: Send + Sync>() {}
+        check::<GpuPipelines>();
+        check::<GpuDecoder>();
+        check::<GpuDeveloper>();
     }
 
     #[test]

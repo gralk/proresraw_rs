@@ -1,6 +1,8 @@
 //! The raw conversion on the GPU: [`crate::develop_planar`], pass for pass.
 
-use super::{GpuError, GpuFrame, Slot, entry, read_buffers_with, sample_bytes};
+use std::sync::Arc;
+
+use super::{GpuError, GpuFrame, GpuPipelines, Slot, entry, read_buffers_with, sample_bytes};
 use crate::decoder::Frame;
 use crate::demosaic::{Conversion, DemosaicParams, RgbPlanes, Stage};
 use crate::header::FrameHeader;
@@ -21,12 +23,10 @@ const PARAMS_BYTES: usize = 112;
 /// operation; a device may still round some divisions and square roots
 /// differently from the host.
 ///
-/// Holds the pipelines and scratch buffers reused across frames; use one
-/// per thread.
+/// Holds scratch buffers reused across frames; use one per thread, all
+/// sharing one [`GpuPipelines`].
 pub struct GpuDeveloper {
-    layout: wgpu::BindGroupLayout,
-    green: wgpu::ComputePipeline,
-    chroma: wgpu::ComputePipeline,
+    pipelines: Arc<GpuPipelines>,
     params: Slot,
     lut: Slot,
     samples: Slot,
@@ -117,9 +117,15 @@ pub fn plane_bytes(header: &FrameHeader) -> u64 {
     (usize::from(header.width) * usize::from(header.height) * 4) as u64
 }
 
-impl GpuDeveloper {
-    /// Compile the conversion pipelines for `device`.
-    pub fn new(device: &wgpu::Device) -> Self {
+/// The conversion's part of [`GpuPipelines`].
+pub(super) struct Pipelines {
+    layout: wgpu::BindGroupLayout,
+    green: wgpu::ComputePipeline,
+    chroma: wgpu::ComputePipeline,
+}
+
+impl Pipelines {
+    pub(super) fn new(device: &wgpu::Device) -> Self {
         let buffer = |binding, ty| wgpu::BindGroupLayoutEntry {
             binding,
             visibility: wgpu::ShaderStages::COMPUTE,
@@ -163,11 +169,27 @@ impl GpuDeveloper {
                 cache: None,
             })
         };
-        let copy_storage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
-        GpuDeveloper {
+        Pipelines {
             green: pipeline("green"),
             chroma: pipeline("chroma"),
             layout,
+        }
+    }
+}
+
+impl GpuDeveloper {
+    /// A developer with its own pipelines, compiled for `device`. Prefer
+    /// [`GpuDeveloper::with_pipelines`] to share them with decoders.
+    pub fn new(device: &wgpu::Device) -> Self {
+        Self::with_pipelines(Arc::new(GpuPipelines::new(device)))
+    }
+
+    /// A developer using shared pipelines. Scratch buffers are allocated
+    /// when the first frame is converted.
+    pub fn with_pipelines(pipelines: Arc<GpuPipelines>) -> Self {
+        let copy_storage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
+        GpuDeveloper {
+            pipelines,
             params: Slot::new(
                 "prores raw develop params",
                 wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
@@ -177,6 +199,11 @@ impl GpuDeveloper {
             rb: Slot::new("prores raw red and blue", wgpu::BufferUsages::STORAGE),
             gr: Slot::new("prores raw green", wgpu::BufferUsages::STORAGE),
         }
+    }
+
+    /// The pipelines this developer runs.
+    pub fn pipelines(&self) -> &Arc<GpuPipelines> {
+        &self.pipelines
     }
 
     /// Convert a frame decoded on the GPU into three new planes. The work
@@ -294,7 +321,7 @@ impl GpuDeveloper {
         let gr = self.gr.get(device, plane);
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("prores raw develop frame"),
-            layout: &self.layout,
+            layout: &self.pipelines.develop.layout,
             entries: &[
                 entry(0, params_buf),
                 entry(1, lut_buf),
@@ -313,7 +340,8 @@ impl GpuDeveloper {
             u32::from(header.width).div_ceil(GROUP_SIDE),
             u32::from(header.height).div_ceil(GROUP_SIDE),
         );
-        for (label, pipeline) in [("green", &self.green), ("chroma", &self.chroma)] {
+        let develop = &self.pipelines.develop;
+        for (label, pipeline) in [("green", &develop.green), ("chroma", &develop.chroma)] {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some(label),
                 timestamp_writes: None,
@@ -401,8 +429,9 @@ mod tests {
         let Some((device, queue)) = device() else {
             return;
         };
+        // One set of pipelines serves both.
         let mut decoder = GpuDecoder::new(&device);
-        let mut developer = GpuDeveloper::new(&device);
+        let mut developer = GpuDeveloper::with_pipelines(decoder.pipelines().clone());
         let mut rng = Rng::new(21);
         let (mut total, mut differ, mut worst) = (0, 0, 0f32);
         for spec in specs(&mut rng) {
