@@ -1191,6 +1191,65 @@ mod tests {
         }
     }
 
+    /// A stream whose zero run wraps the scan position back over a stored
+    /// coefficient: the host overwrites it, and so must the GPU, though it
+    /// ORs every other coefficient into a cleared word.
+    #[test]
+    fn a_wrapped_zero_run_overwrites_like_the_host() {
+        use crate::bits::testing::BitWriter;
+        use crate::codebook::{AC_CB, LN_CB};
+        let Some((device, queue)) = device() else {
+            return;
+        };
+        let mut w = BitWriter::new();
+        w.symbol(FIRST_DC, 0);
+        // One level, +1 at scan position 1.
+        w.symbol(LN_INITIAL, 1);
+        w.symbol(AC_INITIAL, 0);
+        w.put(0, 1);
+        // Ten zeros, then +1 at position 13; the next zero run uses RN_CB[10].
+        w.symbol(RN_INITIAL, 10);
+        w.symbol(AC_CB[0], 0);
+        w.put(0, 1);
+        w.symbol(LN_CB[0], 0);
+        // Over-long under RN_CB[10]: a run of 2^32 - 2, back to position 13.
+        w.put(0, 16);
+        w.put(1, 1);
+        w.put(0, 17);
+        // A level of +2 there, then filler.
+        w.put(0b0100, 4);
+        w.put(u32::MAX, 32);
+        let stream = w.finish();
+
+        let mut coefs = [0i16; 64];
+        decode_component(&stream, 0, 0, &mut coefs);
+        assert_eq!(
+            coefs[usize::from(SCAN[13])],
+            2,
+            "the host stores +1, then 2"
+        );
+
+        let spec = Spec {
+            alignment: 0,
+            valid_tiles: true,
+            ..Spec::new(16, 16, crate::header::BayerPattern::Rggb)
+        };
+        let packet = crate::synth::frame(&spec, |_| {
+            crate::synth::tile(1, &[&stream, &stream, &stream, &stream])
+        });
+        let pipelines = GpuPipelines::new(&device);
+        assert_eq!(
+            gpu_coefficients(&pipelines, &device, &queue, &packet),
+            host_coefficients(&packet)
+        );
+        let gpu = GpuDecoder::with_pipelines(pipelines)
+            .decode(&device, &queue, &packet)
+            .unwrap()
+            .download(&device, &queue)
+            .unwrap();
+        assert_eq!(gpu.samples, crate::decode_frame(&packet).unwrap().samples);
+    }
+
     #[test]
     fn decode_matches_the_host() {
         let Some((device, queue)) = device() else {
