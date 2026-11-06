@@ -26,8 +26,8 @@
 //!
 //! [`GpuDecoder`] and [`GpuDeveloper`] are conveniences that own their
 //! scratch and submit their own work. Underneath, one [`GpuPipelines`] per
-//! device (shared behind an `Arc`) records into an encoder of yours with
-//! buffers of yours:
+//! device (cheap to clone, so shared freely) records into an encoder of
+//! yours with buffers of yours:
 //!
 //! 1. Plan: [`decode_footprint`] (from [`crate::parse_header`] on the
 //!    start of a packet) and [`develop_footprint`] list every buffer a
@@ -50,7 +50,6 @@
 //! values a band reads beyond its edges.
 
 use std::fmt;
-use std::sync::Arc;
 
 mod develop;
 
@@ -260,7 +259,7 @@ impl Slot {
 /// decoder per thread. Frames decoded in a row on the same queue are
 /// ordered, so scratch reuse is safe without waiting.
 pub struct GpuDecoder {
-    pipelines: Arc<GpuPipelines>,
+    pipelines: GpuPipelines,
     params: Slot,
     packet: Slot,
     streams: Slot,
@@ -273,9 +272,12 @@ pub struct GpuDecoder {
 /// The compiled compute pipelines of the decoder and the raw conversion
 /// for one device.
 ///
-/// Compiling them is the expensive part of setting up GPU work; share one
-/// set (behind an [`Arc`]) between every [`GpuDecoder`] and
-/// [`GpuDeveloper`] on the device. They hold no per-frame state.
+/// Compiling them is the expensive part of setting up GPU work; compile
+/// one set per device and share it between every [`GpuDecoder`] and
+/// [`GpuDeveloper`] on it. They hold no per-frame state. Cloning is cheap:
+/// wgpu's pipeline and layout handles are reference-counted, so a clone
+/// shares the compiled pipelines rather than compiling again.
+#[derive(Debug, Clone)]
 pub struct GpuPipelines {
     decode_layout: wgpu::BindGroupLayout,
     decode_streams: wgpu::ComputePipeline,
@@ -346,12 +348,13 @@ impl GpuDecoder {
     /// [`GpuDecoder::with_pipelines`] when several decoders or a
     /// [`GpuDeveloper`] share the device.
     pub fn new(device: &wgpu::Device) -> Self {
-        Self::with_pipelines(Arc::new(GpuPipelines::new(device)))
+        Self::with_pipelines(GpuPipelines::new(device))
     }
 
-    /// A decoder using shared pipelines. Scratch buffers are allocated on
-    /// the pipelines' device when the first frame is decoded.
-    pub fn with_pipelines(pipelines: Arc<GpuPipelines>) -> Self {
+    /// A decoder using shared pipelines (pass a clone to share them).
+    /// Scratch buffers are allocated on the pipelines' device when the
+    /// first frame is decoded.
+    pub fn with_pipelines(pipelines: GpuPipelines) -> Self {
         let copy_storage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
         GpuDecoder {
             pipelines,
@@ -401,7 +404,7 @@ impl GpuDecoder {
     }
 
     /// The pipelines this decoder runs.
-    pub fn pipelines(&self) -> &Arc<GpuPipelines> {
+    pub fn pipelines(&self) -> &GpuPipelines {
         &self.pipelines
     }
 

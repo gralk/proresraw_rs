@@ -1,7 +1,5 @@
 //! The raw conversion on the GPU: [`crate::develop_planar`], pass for pass.
 
-use std::sync::Arc;
-
 use super::{
     BufferRequest, GpuError, GpuFrame, GpuPipelines, Slot, bind, binding_entry, check_limits,
     read_buffers_with, sample_bytes,
@@ -73,7 +71,7 @@ pub fn default_band_rows(header: &FrameHeader, limits: &wgpu::Limits) -> usize {
 /// Holds scratch buffers reused across frames; use one per thread, all
 /// sharing one [`GpuPipelines`].
 pub struct GpuDeveloper {
-    pipelines: Arc<GpuPipelines>,
+    pipelines: GpuPipelines,
     band_rows: Option<usize>,
     params: Slot,
     lut: Slot,
@@ -166,6 +164,7 @@ pub fn plane_bytes(header: &FrameHeader) -> u64 {
 }
 
 /// The conversion's part of [`GpuPipelines`].
+#[derive(Debug, Clone)]
 pub(super) struct Pipelines {
     layout: wgpu::BindGroupLayout,
     green: wgpu::ComputePipeline,
@@ -235,12 +234,12 @@ impl GpuDeveloper {
     /// A developer with its own pipelines, compiled for `device`. Prefer
     /// [`GpuDeveloper::with_pipelines`] to share them with decoders.
     pub fn new(device: &wgpu::Device) -> Self {
-        Self::with_pipelines(Arc::new(GpuPipelines::new(device)))
+        Self::with_pipelines(GpuPipelines::new(device))
     }
 
     /// A developer using shared pipelines. Scratch buffers are allocated
     /// when the first frame is converted.
-    pub fn with_pipelines(pipelines: Arc<GpuPipelines>) -> Self {
+    pub fn with_pipelines(pipelines: GpuPipelines) -> Self {
         let copy_storage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
         GpuDeveloper {
             pipelines,
@@ -257,7 +256,7 @@ impl GpuDeveloper {
     }
 
     /// The pipelines this developer runs.
-    pub fn pipelines(&self) -> &Arc<GpuPipelines> {
+    pub fn pipelines(&self) -> &GpuPipelines {
         &self.pipelines
     }
 

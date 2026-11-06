@@ -319,9 +319,10 @@ chooses the height. Every band height gives the same values; on the RTX
 work. A consumer with its own GPU memory manager uses the layer beneath
 them instead:
 
-- `GpuPipelines::new(device)` compiles the shaders once per device;
-  share it behind an `Arc` (`GpuDecoder::with_pipelines`,
-  `GpuDeveloper::with_pipelines`, or directly).
+- `GpuPipelines::new(device)` compiles the shaders once per device.
+  Clones share the compiled pipelines (wgpu's handles are
+  reference-counted), so pass clones to `GpuDecoder::with_pipelines`,
+  `GpuDeveloper::with_pipelines` or other threads.
 - `gpu::decode_footprint(&header, packet.len())` and
   `gpu::develop_footprint(&header, band_rows, &limits)` list every
   buffer a frame needs (label, bytes, usage), with the header from
