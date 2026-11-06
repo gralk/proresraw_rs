@@ -1474,6 +1474,42 @@ mod tests {
         ));
     }
 
+    /// Skipped tiles come out as 0 even in a buffer full of an earlier
+    /// frame's values: the decode writes every word of its output.
+    #[test]
+    fn skipped_tiles_are_zeroed_in_a_reused_buffer() {
+        let Some((device, queue)) = device() else {
+            return;
+        };
+        let mut decoder = GpuDecoder::new(&device);
+        let mut rng = Rng::new(5);
+        let mut skipped = 0;
+        for spec in specs(&mut rng).iter().step_by(3) {
+            let packet = random_frame(spec, &mut rng);
+            let host = crate::decode_frame(&packet).unwrap();
+            skipped += host.skipped_tiles.len();
+            let size = sample_bytes(&host.header);
+            let samples = device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: true,
+            });
+            samples.slice(..).get_mapped_range_mut().fill(0xa5);
+            samples.unmap();
+            decoder
+                .decode_into(&device, &queue, &packet, &samples)
+                .unwrap();
+            let gpu: Vec<u16> = read_buffer(&device, &queue, &samples, size)
+                .unwrap()
+                .chunks_exact(2)
+                .map(|h| u16::from_le_bytes([h[0], h[1]]))
+                .collect();
+            assert_eq!(gpu, host.samples, "{}x{}", spec.width, spec.height);
+        }
+        assert!(skipped > 0, "no frame had a skipped tile");
+    }
+
     #[test]
     fn release_frees_the_scratch() {
         let Some((device, queue)) = device() else {
