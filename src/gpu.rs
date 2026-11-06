@@ -441,6 +441,21 @@ impl GpuDecoder {
         self.max_qscale = info.max_qscale;
         Ok(info)
     }
+
+    /// Free the scratch buffers, which otherwise keep the size of the
+    /// largest frame decoded so far. The next decode allocates them again,
+    /// sized for its frame. Work already submitted is unaffected.
+    pub fn release(&mut self) {
+        for slot in [
+            &mut self.params,
+            &mut self.packet,
+            &mut self.streams,
+            &mut self.coefs,
+            &mut self.skipped,
+        ] {
+            slot.buffer = None;
+        }
+    }
 }
 
 /// One buffer a GPU operation needs, as its footprint lists it: allocate a
@@ -1242,6 +1257,25 @@ mod tests {
             decoder.decode_into(&device, &queue, &packet[..20], &fine),
             Err(GpuError::Format(_))
         ));
+    }
+
+    #[test]
+    fn release_frees_the_scratch() {
+        let Some((device, queue)) = device() else {
+            return;
+        };
+        let mut decoder = GpuDecoder::new(&device);
+        let mut rng = Rng::new(32);
+        let packet = random_frame(&specs(&mut rng)[0], &mut rng);
+        let first = decoder.decode(&device, &queue, &packet).unwrap();
+        assert!(decoder.coefs.buffer.is_some());
+        decoder.release();
+        assert!(decoder.coefs.buffer.is_none() && decoder.packet.buffer.is_none());
+        let again = decoder.decode(&device, &queue, &packet).unwrap();
+        assert_eq!(
+            again.download(&device, &queue).unwrap(),
+            first.download(&device, &queue).unwrap()
+        );
     }
 
     #[test]

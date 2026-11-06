@@ -261,6 +261,21 @@ impl GpuDeveloper {
         &self.pipelines
     }
 
+    /// Free the scratch buffers, which otherwise keep the size of the
+    /// largest frame converted so far. The next conversion allocates them
+    /// again. Work already submitted is unaffected.
+    pub fn release(&mut self) {
+        for slot in [
+            &mut self.params,
+            &mut self.lut,
+            &mut self.samples,
+            &mut self.rb,
+            &mut self.gr,
+        ] {
+            slot.buffer = None;
+        }
+    }
+
     /// Convert in bands of `rows` rows, or with `None` (the default) in
     /// bands of [`default_band_rows`] for the device. Smaller bands need
     /// less scratch (see [`GpuPipelines::record_develop`]).
