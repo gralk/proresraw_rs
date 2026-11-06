@@ -9,8 +9,8 @@
 //! so a few code values can differ from the host by one.
 //!
 //! Tiles with an invalid header are skipped as on the host: their sensels
-//! are not written, so a fresh output buffer holds 0 there and a buffer
-//! passed to [`GpuDecoder::decode_into`] keeps its contents.
+//! are 0. Every word of the output is written, so an output buffer needs
+//! no clearing first, even one reused from an earlier frame.
 //!
 //! The output buffer holds the code values of the coded picture
 //! ([`FrameHeader::coded_width`] × [`FrameHeader::coded_height`] sensels,
@@ -521,8 +521,8 @@ pub struct DecodeFootprint {
     pub coefs: BufferRequest,
     /// One bit per 16×16 square of a skipped tile. Uploaded.
     pub skipped: BufferRequest,
-    /// The output code values ([`sample_bytes`]), written by the transform
-    /// pass.
+    /// The output code values ([`sample_bytes`]), every word written by
+    /// the transform pass, so it need not be cleared.
     pub samples: BufferRequest,
 }
 
@@ -612,7 +612,7 @@ pub struct DecodeInfo {
     /// The frame header.
     pub header: FrameHeader,
     /// Indices of tiles skipped for an invalid header; their sensels are
-    /// not written.
+    /// written as 0.
     pub skipped_tiles: Vec<usize>,
     /// Largest qscale byte over all tiles, as in [`Frame::max_qscale`].
     pub max_qscale: u8,

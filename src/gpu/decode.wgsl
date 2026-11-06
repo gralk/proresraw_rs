@@ -405,7 +405,7 @@ fn column_pass(r: array<f32, 8>) -> array<u32, 8> {
 
 // Workgroup (x, y) is the square at those coordinates. Invocation t
 // transforms row and then column t % 8 of stream t / 8, then writes four
-// words of the square's output, unless the square's tile was skipped.
+// words of the square's output, zeros if the square's tile was skipped.
 @compute @workgroup_size(32)
 fn transform(
     @builtin(workgroup_id) group: vec3<u32>,
@@ -439,10 +439,9 @@ fn transform(
     }
     workgroupBarrier();
 
-    // Nothing is written for a skipped tile.
-    if ((skipped[square >> 5u] >> (square & 31u)) & 1u) != 0u {
-        return;
-    }
+    // A skipped tile's sensels are written as 0, as the host leaves them,
+    // so that the output needs no clearing beforehand.
+    let skip = ((skipped[square >> 5u] >> (square & 31u)) & 1u) != 0u;
     // Sensel (r, c) of the square is element (r / 2, c / 2) of the block
     // of the stream on phase (r % 2, c % 2). Word w of a row holds columns
     // 2w and 2w + 1.
@@ -452,6 +451,6 @@ fn transform(
     let out_row = (group.y * 16u + r) * params.squares_x * 8u + group.x * 8u;
     for (var j = 0u; j < 4u; j++) {
         let w = (t & 1u) * 4u + j;
-        samples[out_row + w] = blocks[even + w] | (blocks[odd + w] << 16u);
+        samples[out_row + w] = select(blocks[even + w] | (blocks[odd + w] << 16u), 0u, skip);
     }
 }
