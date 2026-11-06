@@ -28,7 +28,8 @@ use std::sync::Arc;
 mod develop;
 
 pub use develop::{
-    DevelopBuffers, DevelopFootprint, GpuDeveloper, GpuRgb, develop_footprint, plane_bytes,
+    DEVELOP_GREEN_HALO, DEVELOP_INPUT_HALO, DevelopBuffers, DevelopFootprint, GpuDeveloper, GpuRgb,
+    default_band_rows, develop_footprint, develop_row_bytes, plane_bytes,
 };
 
 use crate::codebook::{

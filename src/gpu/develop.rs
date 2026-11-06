@@ -12,8 +12,52 @@ use crate::header::FrameHeader;
 
 /// Invocations per side of a workgroup of both passes.
 const GROUP_SIDE: u32 = 16;
-/// Bytes of the parameter block.
-const PARAMS_BYTES: usize = 112;
+/// Bytes of the parameter block of one band.
+const PARAMS_BYTES: usize = 128;
+
+/// Rows of code values a band of the conversion reads beyond each of its
+/// edges (inside the picture): the green pass needs two rows around each
+/// of its rows, and it covers one row beyond the band.
+pub const DEVELOP_INPUT_HALO: usize = 3;
+
+/// Green-pass rows a band computes beyond each of its edges (inside the
+/// picture), which the chroma pass of the band reads.
+pub const DEVELOP_GREEN_HALO: usize = 1;
+
+/// Scratch bytes per green-pass row of a frame with this header: two `f32`
+/// planes. A band of `rows` rows needs `rows + 2 * DEVELOP_GREEN_HALO`
+/// green rows (fewer at the picture's edges).
+pub fn develop_row_bytes(header: &FrameHeader) -> u64 {
+    8 * u64::from(header.width)
+}
+
+/// Green-pass rows of the band starting at `y0` with `rows` rows, in a
+/// picture `height` rows tall: (first, count).
+fn green_rows(y0: usize, rows: usize, height: usize) -> (usize, usize) {
+    let g0 = y0.saturating_sub(DEVELOP_GREEN_HALO);
+    let g1 = (y0 + rows + DEVELOP_GREEN_HALO).min(height);
+    (g0, g1 - g0)
+}
+
+/// The band height the conversion uses unless told otherwise: the whole
+/// frame when its green planes fit the device's storage binding and buffer
+/// limits, otherwise the tallest band whose green planes fit, rounded down
+/// to a multiple of 16 rows.
+pub fn default_band_rows(header: &FrameHeader, limits: &wgpu::Limits) -> usize {
+    let height = usize::from(header.height);
+    let limit = u64::from(limits.max_storage_buffer_binding_size).min(limits.max_buffer_size);
+    let row = (develop_row_bytes(header) / 2).max(1);
+    let fit = (limit / row) as usize;
+    if fit >= height {
+        return height;
+    }
+    let rows = fit.saturating_sub(2 * DEVELOP_GREEN_HALO);
+    if rows >= 16 {
+        rows / 16 * 16
+    } else {
+        rows.max(1)
+    }
+}
 
 /// Runs the raw conversion on one wgpu device.
 ///
@@ -30,6 +74,7 @@ const PARAMS_BYTES: usize = 112;
 /// sharing one [`GpuPipelines`].
 pub struct GpuDeveloper {
     pipelines: Arc<GpuPipelines>,
+    band_rows: Option<usize>,
     params: Slot,
     lut: Slot,
     samples: Slot,
@@ -134,7 +179,8 @@ impl Pipelines {
             visibility: wgpu::ShaderStages::COMPUTE,
             ty: wgpu::BindingType::Buffer {
                 ty,
-                has_dynamic_offset: false,
+                // The parameters: one block per band.
+                has_dynamic_offset: binding == 0,
                 min_binding_size: None,
             },
             count: None,
@@ -198,6 +244,7 @@ impl GpuDeveloper {
         let copy_storage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
         GpuDeveloper {
             pipelines,
+            band_rows: None,
             params: Slot::new(
                 "prores raw develop params",
                 wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
@@ -212,6 +259,13 @@ impl GpuDeveloper {
     /// The pipelines this developer runs.
     pub fn pipelines(&self) -> &Arc<GpuPipelines> {
         &self.pipelines
+    }
+
+    /// Convert in bands of `rows` rows, or with `None` (the default) in
+    /// bands of [`default_band_rows`] for the device. Smaller bands need
+    /// less scratch (see [`GpuPipelines::record_develop`]).
+    pub fn set_band_rows(&mut self, rows: Option<usize>) {
+        self.band_rows = rows;
     }
 
     /// Convert a frame decoded on the GPU into three new planes. The work
@@ -292,7 +346,11 @@ impl GpuDeveloper {
         samples: &wgpu::Buffer,
         out: [&wgpu::Buffer; 3],
     ) -> Result<(), GpuError> {
-        let f = develop_footprint(header);
+        let limits = device.limits();
+        let band_rows = self
+            .band_rows
+            .unwrap_or_else(|| default_band_rows(header, &limits));
+        let f = develop_footprint(header, band_rows, &limits);
         let buffers = DevelopBuffers {
             params: self
                 .params
@@ -316,6 +374,7 @@ impl GpuDeveloper {
             header,
             params,
             stage,
+            band_rows,
             &buffers,
         )?;
         queue.submit([encoder.finish()]);
@@ -373,11 +432,18 @@ impl DevelopFootprint {
     }
 }
 
-/// What converting a frame with `header` needs from the device besides
-/// its code values.
-pub fn develop_footprint(header: &FrameHeader) -> DevelopFootprint {
+/// What converting a frame with `header` in bands of `band_rows` rows
+/// needs from the device besides its code values. `limits` gives the
+/// uniform offset alignment, which spaces the bands' parameter blocks.
+pub fn develop_footprint(
+    header: &FrameHeader,
+    band_rows: usize,
+    limits: &wgpu::Limits,
+) -> DevelopFootprint {
     use wgpu::BufferUsages as U;
     let plane = plane_bytes(header).max(4);
+    let bands = Bands::new(header, band_rows, limits);
+    let scratch = (bands.green_rows as u64 * develop_row_bytes(header) / 2).max(4);
     let request = |label, bytes, usage| BufferRequest {
         label,
         bytes,
@@ -387,15 +453,40 @@ pub fn develop_footprint(header: &FrameHeader) -> DevelopFootprint {
     DevelopFootprint {
         params: request(
             "prores raw develop params",
-            PARAMS_BYTES as u64,
+            bands.count as u64 * bands.stride,
             U::UNIFORM | U::COPY_DST,
         ),
         lut: request("prores raw develop table", 65536 * 4, upload),
-        rb: request("prores raw red and blue", plane, U::STORAGE),
-        gr: request("prores raw green", plane, U::STORAGE),
+        rb: request("prores raw red and blue", scratch, U::STORAGE),
+        gr: request("prores raw green", scratch, U::STORAGE),
         red: request("prores raw red", plane, U::STORAGE),
         green: request("prores raw green plane", plane, U::STORAGE),
         blue: request("prores raw blue", plane, U::STORAGE),
+    }
+}
+
+/// How a frame is cut into bands.
+struct Bands {
+    /// Rows per band (the last may have fewer).
+    rows: usize,
+    count: usize,
+    /// Largest green-pass row count of any band.
+    green_rows: usize,
+    /// Bytes between bands' parameter blocks.
+    stride: u64,
+}
+
+impl Bands {
+    fn new(header: &FrameHeader, band_rows: usize, limits: &wgpu::Limits) -> Self {
+        let height = usize::from(header.height).max(1);
+        let rows = band_rows.clamp(1, height);
+        Bands {
+            rows,
+            count: height.div_ceil(rows),
+            green_rows: (rows + 2 * DEVELOP_GREEN_HALO).min(height),
+            stride: (PARAMS_BYTES as u64)
+                .next_multiple_of(u64::from(limits.min_uniform_buffer_offset_alignment)),
+        }
     }
 }
 
@@ -434,6 +525,14 @@ impl GpuPipelines {
     /// conversions recorded into one submission need separate upload
     /// buffers. The code values may come from a decode recorded earlier in
     /// the same encoder.
+    ///
+    /// The conversion runs in bands of `band_rows` rows, all recorded here,
+    /// one after another through the same green-pass planes, so those hold
+    /// one band's rows rather than the frame's; the footprint must be for
+    /// the same band height. Any band height gives the same values. Use
+    /// [`default_band_rows`] for the device's limits, or a planner's
+    /// choice with [`DEVELOP_INPUT_HALO`], [`DEVELOP_GREEN_HALO`] and
+    /// [`develop_row_bytes`].
     #[allow(clippy::too_many_arguments)]
     pub fn record_develop(
         &self,
@@ -443,9 +542,12 @@ impl GpuPipelines {
         header: &FrameHeader,
         params: &DemosaicParams,
         stage: Stage,
+        band_rows: usize,
         buffers: &DevelopBuffers<'_>,
     ) -> Result<(), GpuError> {
-        let footprint = develop_footprint(header);
+        let limits = device.limits();
+        let footprint = develop_footprint(header, band_rows, &limits);
+        let bands = Bands::new(header, band_rows, &limits);
         let samples = BufferRequest {
             label: "prores raw samples",
             bytes: sample_bytes(header),
@@ -453,10 +555,9 @@ impl GpuPipelines {
         };
         check_limits(device, &footprint.requests()[1..])?;
         check_limits(device, &[samples])?;
-        let limits = device.limits();
         let b =
             |binding, request| bind(binding, request, limits.min_storage_buffer_offset_alignment);
-        let params_b = bind(
+        let mut params_b = bind(
             &buffers.params,
             &footprint.params,
             limits.min_uniform_buffer_offset_alignment,
@@ -470,11 +571,21 @@ impl GpuPipelines {
         let blue_b = b(&buffers.blue, &footprint.blue)?;
 
         let conversion = Conversion::new(header, params, stage);
-        queue.write_buffer(
-            params_b.buffer,
-            params_b.offset,
-            &params_block(header, &conversion),
-        );
+        let height = usize::from(header.height);
+        let mut blocks = vec![0u8; footprint.params.bytes as usize];
+        let mut dispatches = Vec::with_capacity(bands.count);
+        for band in 0..bands.count {
+            let y0 = band * bands.rows;
+            let rows = bands.rows.min(height - y0);
+            let (g0, g_rows) = green_rows(y0, rows, height);
+            let block = params_block(header, &conversion, [y0, rows, g0, g_rows]);
+            let at = band * bands.stride as usize;
+            blocks[at..at + PARAMS_BYTES].copy_from_slice(&block);
+            dispatches.push((rows as u32, g_rows as u32));
+        }
+        queue.write_buffer(params_b.buffer, params_b.offset, &blocks);
+        // Each band binds its own block through a dynamic offset.
+        params_b.size = wgpu::BufferSize::new(PARAMS_BYTES as u64);
         let lut: Vec<u8> = conversion
             .lut
             .iter()
@@ -495,18 +606,20 @@ impl GpuPipelines {
                 binding_entry(7, blue_b),
             ],
         });
-        let groups = (
-            u32::from(header.width).div_ceil(GROUP_SIDE),
-            u32::from(header.height).div_ceil(GROUP_SIDE),
-        );
+        let columns = u32::from(header.width).div_ceil(GROUP_SIDE);
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("prores raw develop"),
             timestamp_writes: None,
         });
-        pass.set_bind_group(0, &bind_group, &[]);
-        for pipeline in [&self.develop.green, &self.develop.chroma] {
-            pass.set_pipeline(pipeline);
-            pass.dispatch_workgroups(groups.0, groups.1, 1);
+        // wgpu orders dispatches that share read-write storage, so each
+        // band's green pass waits for the previous band's chroma pass.
+        for (band, (rows, g_rows)) in dispatches.into_iter().enumerate() {
+            let offset = (band as u64 * bands.stride) as u32;
+            pass.set_bind_group(0, &bind_group, &[offset]);
+            pass.set_pipeline(&self.develop.green);
+            pass.dispatch_workgroups(columns, g_rows.div_ceil(GROUP_SIDE), 1);
+            pass.set_pipeline(&self.develop.chroma);
+            pass.dispatch_workgroups(columns, rows.div_ceil(GROUP_SIDE), 1);
         }
         Ok(())
     }
@@ -524,8 +637,9 @@ fn new_planes(device: &wgpu::Device, header: &FrameHeader) -> [wgpu::Buffer; 3] 
     })
 }
 
-/// The shader's `Params` block.
-fn params_block(header: &FrameHeader, c: &Conversion) -> Vec<u8> {
+/// The shader's `Params` block for one band: `band` is the output's first
+/// row and row count, then the green pass's.
+fn params_block(header: &FrameHeader, c: &Conversion, band: [usize; 4]) -> Vec<u8> {
     let p = &c.params;
     let f = |v: f32| v.to_bits();
     // The green pass offsets by black * (1 / range), the chroma pass by
@@ -554,6 +668,7 @@ fn params_block(header: &FrameHeader, c: &Conversion) -> Vec<u8> {
         words.extend(row.iter().map(|&v| f(v)));
         words.push(0);
     }
+    words.extend(band.map(|v| v as u32));
     debug_assert_eq!(words.len() * 4, PARAMS_BYTES);
     words.iter().flat_map(|w| w.to_le_bytes()).collect()
 }
@@ -616,6 +731,82 @@ mod tests {
         }
         eprintln!("GPU vs host develop: {differ} of {total} values differ, max |diff| {worst:e}");
         assert_eq!(differ, 0);
+    }
+
+    /// Any band height gives the host's values: bands of one row (whose
+    /// green rows reach past both edges), heights around the workgroup
+    /// size, and the whole frame.
+    #[test]
+    fn every_band_height_matches_the_host() {
+        let Some((device, queue)) = device() else {
+            return;
+        };
+        let mut decoder = GpuDecoder::new(&device);
+        let mut developer = GpuDeveloper::with_pipelines(decoder.pipelines().clone());
+        let mut rng = Rng::new(25);
+        for spec in specs(&mut rng).into_iter().take(4) {
+            let spec = Spec {
+                valid_tiles: true,
+                ..spec
+            };
+            let packet = random_frame(&spec, &mut rng);
+            let host_frame = crate::decode_frame(&packet).unwrap();
+            let params = DemosaicParams::new(&host_frame.header, host_frame.quantizer());
+            let host = crate::develop_planar(&host_frame, &params, Stage::Rec2020);
+            let frame = decoder.decode(&device, &queue, &packet).unwrap();
+            for rows in [1, 2, 3, 15, 16, 17, host_frame.height()] {
+                developer.set_band_rows(Some(rows));
+                let gpu = developer
+                    .develop(&device, &queue, &frame, &params, Stage::Rec2020)
+                    .unwrap()
+                    .download(&device, &queue)
+                    .unwrap();
+                assert_eq!(compare(&gpu, &host).0, 0, "{rows}-row bands");
+            }
+        }
+    }
+
+    #[test]
+    fn bands_size_the_scratch() {
+        let mut rng = Rng::new(26);
+        let header = crate::parse_header(&random_frame(
+            &Spec::new(320, 96, crate::BayerPattern::Rggb),
+            &mut rng,
+        ))
+        .unwrap();
+        let limits = wgpu::Limits::default();
+        let stride = u64::from(limits.min_uniform_buffer_offset_alignment);
+        for (rows, green_rows, bands) in [(1, 3, 96), (16, 18, 6), (40, 42, 3), (96, 96, 1)] {
+            let f = develop_footprint(&header, rows, &limits);
+            assert_eq!(f.rb.bytes, green_rows * 320 * 4, "{rows}");
+            assert_eq!(f.gr.bytes, f.rb.bytes);
+            assert_eq!(f.params.bytes, bands * stride);
+            assert_eq!(f.red.bytes, 320 * 96 * 4);
+        }
+        assert_eq!(develop_row_bytes(&header), 320 * 8);
+    }
+
+    #[test]
+    fn default_band_fits_the_binding_limit() {
+        let mut rng = Rng::new(27);
+        let header = crate::parse_header(&random_frame(
+            &Spec::new(1000, 512, crate::BayerPattern::Rggb),
+            &mut rng,
+        ))
+        .unwrap();
+        let limits = |bytes: u32| wgpu::Limits {
+            max_storage_buffer_binding_size: bytes,
+            ..wgpu::Limits::default()
+        };
+        // The whole frame's green planes fit.
+        assert_eq!(default_band_rows(&header, &limits(512 * 4000)), 512);
+        // 200 rows fit: 198 with the halo, rounded down to 192.
+        assert_eq!(default_band_rows(&header, &limits(200 * 4000)), 192);
+        // Fewer than 16 rows fit: no rounding.
+        assert_eq!(default_band_rows(&header, &limits(12 * 4000)), 10);
+        assert_eq!(default_band_rows(&header, &limits(100)), 1);
+        let rows = default_band_rows(&header, &limits(200 * 4000));
+        assert!(develop_footprint(&header, rows, &limits(0)).rb.bytes <= 200 * 4000);
     }
 
     #[test]
@@ -683,7 +874,8 @@ mod tests {
         let packet = random_frame(&spec, &mut rng);
         let header = crate::parse_header(&packet).unwrap();
         let decode = crate::gpu::decode_footprint(&header, packet.len());
-        let develop = develop_footprint(&header);
+        let limits = device.limits();
+        let develop = develop_footprint(&header, 16, &limits);
         let align = u64::from(device.limits().min_storage_buffer_offset_alignment);
         let mut end = 0u64;
         let mut place = |bytes: u64| {
@@ -747,6 +939,7 @@ mod tests {
                 &info.header,
                 &params,
                 Stage::Rec2020,
+                16,
                 &develop_buffers,
             )
             .unwrap();

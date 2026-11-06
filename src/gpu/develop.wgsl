@@ -32,6 +32,13 @@ struct Params {
     zero: u32,
     // Rows of the output matrix (fourth lanes unused).
     matrix: array<vec4<f32>, 3>,
+    // The band: first row and row count of the output, and of the green
+    // pass, which covers the band and one row beyond each edge inside the
+    // picture. The green planes hold only the band's green rows.
+    band_y0: u32,
+    band_rows: u32,
+    green_y0: u32,
+    green_rows: u32,
 }
 
 // A uniform, for the constant cache. The storage bindings are all
@@ -42,7 +49,8 @@ struct Params {
 @group(0) @binding(1) var<storage, read_write> lut: array<f32>;
 // Code values, two per word, the even column in the low half.
 @group(0) @binding(2) var<storage, read_write> samples: array<u32>;
-// Green pass output: red or blue (0 at green sites), and green.
+// Green pass output for the band's green rows: red or blue (0 at green
+// sites), and green.
 @group(0) @binding(3) var<storage, read_write> rb: array<f32>;
 @group(0) @binding(4) var<storage, read_write> gr: array<f32>;
 // Output planes.
@@ -137,13 +145,13 @@ fn mirror(d: vec4<f32>, pos: u32, len: u32, c: f32) -> vec4<f32> {
 @compute @workgroup_size(16, 16)
 fn green(@builtin(global_invocation_id) id: vec3<u32>) {
     let x = id.x;
-    let y = id.y;
     let w = params.width;
     let h = params.height;
-    if x >= w || y >= h {
+    if x >= w || id.y >= params.green_rows {
         return;
     }
-    let o = y * w + x;
+    let y = params.green_y0 + id.y;
+    let o = id.y * w + x;
     let xi = i32(x);
     let yi = i32(y);
     let red_row = params.cfa >> 1u;
@@ -233,9 +241,10 @@ fn estimate(xx: vec4<f32>, gg: vec4<f32>, cg: f32, cs: f32) -> f32 {
     return fma(mean_mid - mean_x, weight, mean_x);
 }
 
-// Red or blue and green of the green pass at (x, y).
+// Red or blue and green of the green pass at (x, y), a row of the band's
+// green rows.
 fn at(x: u32, y: u32) -> vec2<f32> {
-    let i = y * params.width + x;
+    let i = (y - params.green_y0) * params.width + x;
     return vec2<f32>(rb[i], gr[i]);
 }
 
@@ -247,12 +256,12 @@ fn pair(u: vec2<f32>, v: vec2<f32>, cg: f32, cs: f32) -> f32 {
 @compute @workgroup_size(16, 16)
 fn chroma(@builtin(global_invocation_id) id: vec3<u32>) {
     let x = id.x;
-    let y = id.y;
     let w = params.width;
     let h = params.height;
-    if x >= w || y >= h {
+    if x >= w || id.y >= params.band_rows {
         return;
     }
+    let y = params.band_y0 + id.y;
     let mx = mirrored(x, w);
     let my = mirrored(y, h);
     let here = at(x, y);

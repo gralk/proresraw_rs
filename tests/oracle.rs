@@ -124,7 +124,16 @@ fn gpu_develop_matches_the_host_on_every_fixture() {
         let host_frame = proresraw_rs::decode_frame(&packet).unwrap();
         let params = DemosaicParams::new(&host_frame.header, host_frame.quantizer());
         let frame = decoder.decode(&device, &queue, &packet).unwrap();
-        for stage in [Stage::Demosaiced, Stage::WhiteBalanced, Stage::Rec2020] {
+        // The default bands (the whole frame where it fits), then bands of
+        // 37 rows at the last stage.
+        let runs = [
+            (Stage::Demosaiced, None),
+            (Stage::WhiteBalanced, None),
+            (Stage::Rec2020, None),
+            (Stage::Rec2020, Some(37)),
+        ];
+        for (stage, rows) in runs {
+            developer.set_band_rows(rows);
             let host = develop_planar(&host_frame, &params, stage);
             let gpu = developer
                 .develop(&device, &queue, &frame, &params, stage)
@@ -145,7 +154,7 @@ fn gpu_develop_matches_the_host_on_every_fixture() {
             assert_eq!(
                 mismatches,
                 0,
-                "{} {stage:?}: {mismatches} values differ",
+                "{} {stage:?} bands {rows:?}: {mismatches} values differ",
                 packet_path.display()
             );
         }
