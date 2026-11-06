@@ -188,11 +188,26 @@ fn level(cb: u32) -> vec2<i32> {
     return vec2<i32>(bitcast<i32>(cw.x), magnitude);
 }
 
+// Set once a zero run wraps the scan position back over coefficients
+// already stored (see `decode_streams`).
+var<private> revisiting: bool;
+
 // Store coefficient `raster` of the block whose words start at `block`.
-// Each coefficient is stored at most once.
+// Until the scan position wraps, each coefficient is stored at most once,
+// so ORing it into its cleared word is exact; after that a store must
+// replace the half it lands on, as on the host. Only the invocation of
+// the block's stream touches its words, so the load and store need no
+// atomicity between them.
 fn put(block: u32, raster: u32, v: i32) {
     let shift = (raster & 1u) * 16u;
-    atomicOr(&coef_bits[block + (raster >> 1u)], (u32(v) & 0xffffu) << shift);
+    let word = block + (raster >> 1u);
+    let bits = (u32(v) & 0xffffu) << shift;
+    if revisiting {
+        let kept = atomicLoad(&coef_bits[word]) & ~(0xffffu << shift);
+        atomicStore(&coef_bits[word], kept | bits);
+    } else {
+        atomicOr(&coef_bits[word], bits);
+    }
 }
 
 @compute @workgroup_size(64)
@@ -211,6 +226,7 @@ fn decode_streams(
     let codes = 64u * blocks;
     let block_mask = blocks - 1u;
     let base = st.square * 128u + (st.info >> 16u) * 32u;
+    revisiting = false;
     reader_init(st.offset, st.len);
 
     // DC: a sign-folded first value, then deltas with a running sign.
@@ -269,7 +285,13 @@ fn decode_streams(
         let zeros = codeword(win_hi, rn_cb);
         rn_cb = RN_CB[min(zeros.x, 27u)];
         consume(zeros.y);
+        // An over-long codeword can give a run near 2^32, which wraps the
+        // position back to coefficients already stored.
+        let before = n;
         n = n + 1u + zeros.x;
+        if n < before {
+            revisiting = true;
+        }
         if n >= codes || win_hi == 0u {
             return;
         }
