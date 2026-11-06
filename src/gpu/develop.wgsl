@@ -34,11 +34,14 @@ struct Params {
     matrix: array<vec4<f32>, 3>,
 }
 
+// A uniform, for the constant cache. The storage bindings are all
+// read_write, even those only read, so that a caller may place them all in
+// one buffer (see `GpuPipelines::new`).
 @group(0) @binding(0) var<uniform> params: Params;
 // Code value to normalized linear value.
-@group(0) @binding(1) var<storage, read> lut: array<f32>;
+@group(0) @binding(1) var<storage, read_write> lut: array<f32>;
 // Code values, two per word, the even column in the low half.
-@group(0) @binding(2) var<storage, read> samples: array<u32>;
+@group(0) @binding(2) var<storage, read_write> samples: array<u32>;
 // Green pass output: red or blue (0 at green sites), and green.
 @group(0) @binding(3) var<storage, read_write> rb: array<f32>;
 @group(0) @binding(4) var<storage, read_write> gr: array<f32>;

@@ -2,7 +2,10 @@
 
 use std::sync::Arc;
 
-use super::{GpuError, GpuFrame, GpuPipelines, Slot, entry, read_buffers_with, sample_bytes};
+use super::{
+    BufferRequest, GpuError, GpuFrame, GpuPipelines, Slot, bind, binding_entry, check_limits,
+    read_buffers_with, sample_bytes,
+};
 use crate::decoder::Frame;
 use crate::demosaic::{Conversion, DemosaicParams, RgbPlanes, Stage};
 use crate::header::FrameHeader;
@@ -139,10 +142,15 @@ impl Pipelines {
         let storage = |read_only| wgpu::BufferBindingType::Storage { read_only };
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("prores raw develop"),
+            // The parameters are a uniform: read on every invocation, they
+            // belong in the constant cache, and as read-write storage the
+            // conversion runs 40 % slower. Everything else is read-write
+            // storage so that a caller may place it all in one buffer (see
+            // the decode layout in `GpuPipelines::new`).
             entries: &[
                 buffer(0, wgpu::BufferBindingType::Uniform),
-                buffer(1, storage(true)),
-                buffer(2, storage(true)),
+                buffer(1, storage(false)),
+                buffer(2, storage(false)),
                 buffer(3, storage(false)),
                 buffer(4, storage(false)),
                 buffer(5, storage(false)),
@@ -284,78 +292,222 @@ impl GpuDeveloper {
         samples: &wgpu::Buffer,
         out: [&wgpu::Buffer; 3],
     ) -> Result<(), GpuError> {
-        let needed = sample_bytes(header);
-        let plane = plane_bytes(header);
-        let inputs = std::iter::once((samples, needed, "samples"));
-        for (buffer, needed, what) in inputs.chain(out.map(|b| (b, plane, "plane"))) {
-            if buffer.size() < needed {
-                return Err(GpuError::BufferTooSmall {
-                    what,
-                    size: buffer.size(),
-                    needed,
-                });
-            }
-            if !buffer.usage().contains(wgpu::BufferUsages::STORAGE) {
-                return Err(GpuError::MissingUsage {
-                    what,
-                    needs: wgpu::BufferUsages::STORAGE,
-                });
-            }
-        }
+        let f = develop_footprint(header);
+        let buffers = DevelopBuffers {
+            params: self
+                .params
+                .get(device, f.params.bytes)
+                .as_entire_buffer_binding(),
+            lut: self.lut.get(device, f.lut.bytes).as_entire_buffer_binding(),
+            samples: samples.as_entire_buffer_binding(),
+            rb: self.rb.get(device, f.rb.bytes).as_entire_buffer_binding(),
+            gr: self.gr.get(device, f.gr.bytes).as_entire_buffer_binding(),
+            red: out[0].as_entire_buffer_binding(),
+            green: out[1].as_entire_buffer_binding(),
+            blue: out[2].as_entire_buffer_binding(),
+        };
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("prores raw develop"),
+        });
+        self.pipelines.record_develop(
+            device,
+            queue,
+            &mut encoder,
+            header,
+            params,
+            stage,
+            &buffers,
+        )?;
+        queue.submit([encoder.finish()]);
+        Ok(())
+    }
+}
+
+/// The buffers [`GpuPipelines::record_develop`] needs for one frame, in
+/// the order of [`DevelopBuffers`] (whose `samples`, the decoder's output,
+/// is not listed here: see [`super::DecodeFootprint::samples`]).
+///
+/// Storage bindings must start at multiples of the device's
+/// `min_storage_buffer_offset_alignment`; the conversion binds exactly
+/// `bytes` of each. The storage requests may all be regions of one buffer;
+/// the parameters need a buffer of their own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DevelopFootprint {
+    /// The conversion's constants, a uniform block. Uploaded. Its binding
+    /// starts at a multiple of `min_uniform_buffer_offset_alignment`, and
+    /// as wgpu tracks usage per buffer it must not share a buffer with the
+    /// other (storage) bindings.
+    pub params: BufferRequest,
+    /// Code value to normalized linear value, 65536 `f32`. Uploaded.
+    pub lut: BufferRequest,
+    /// Green pass output, red or blue per sensel: written by the green
+    /// pass, read by the chroma pass, dead after it.
+    pub rb: BufferRequest,
+    /// Green pass output, green per sensel; like `rb`.
+    pub gr: BufferRequest,
+    /// The output R plane, `width * height` `f32`.
+    pub red: BufferRequest,
+    /// The output G plane.
+    pub green: BufferRequest,
+    /// The output B plane.
+    pub blue: BufferRequest,
+}
+
+impl DevelopFootprint {
+    /// The requests in [`DevelopBuffers`] order, without `samples`.
+    pub fn requests(&self) -> [BufferRequest; 7] {
+        [
+            self.params,
+            self.lut,
+            self.rb,
+            self.gr,
+            self.red,
+            self.green,
+            self.blue,
+        ]
+    }
+
+    /// Total bytes of all requests.
+    pub fn bytes(&self) -> u64 {
+        self.requests().iter().map(|r| r.bytes).sum()
+    }
+}
+
+/// What converting a frame with `header` needs from the device besides
+/// its code values.
+pub fn develop_footprint(header: &FrameHeader) -> DevelopFootprint {
+    use wgpu::BufferUsages as U;
+    let plane = plane_bytes(header).max(4);
+    let request = |label, bytes, usage| BufferRequest {
+        label,
+        bytes,
+        usage,
+    };
+    let upload = U::STORAGE | U::COPY_DST;
+    DevelopFootprint {
+        params: request(
+            "prores raw develop params",
+            PARAMS_BYTES as u64,
+            U::UNIFORM | U::COPY_DST,
+        ),
+        lut: request("prores raw develop table", 65536 * 4, upload),
+        rb: request("prores raw red and blue", plane, U::STORAGE),
+        gr: request("prores raw green", plane, U::STORAGE),
+        red: request("prores raw red", plane, U::STORAGE),
+        green: request("prores raw green plane", plane, U::STORAGE),
+        blue: request("prores raw blue", plane, U::STORAGE),
+    }
+}
+
+/// Caller-provided buffers for [`GpuPipelines::record_develop`]: the
+/// frame's code values and one binding per [`DevelopFootprint`] request.
+#[derive(Debug, Clone)]
+pub struct DevelopBuffers<'a> {
+    /// See [`DevelopFootprint::params`].
+    pub params: wgpu::BufferBinding<'a>,
+    /// See [`DevelopFootprint::lut`].
+    pub lut: wgpu::BufferBinding<'a>,
+    /// The frame's code values, as [`super::GpuPipelines::record_decode`]
+    /// writes them ([`sample_bytes`]). Only read.
+    pub samples: wgpu::BufferBinding<'a>,
+    /// See [`DevelopFootprint::rb`].
+    pub rb: wgpu::BufferBinding<'a>,
+    /// See [`DevelopFootprint::gr`].
+    pub gr: wgpu::BufferBinding<'a>,
+    /// See [`DevelopFootprint::red`].
+    pub red: wgpu::BufferBinding<'a>,
+    /// See [`DevelopFootprint::green`].
+    pub green: wgpu::BufferBinding<'a>,
+    /// See [`DevelopFootprint::blue`].
+    pub blue: wgpu::BufferBinding<'a>,
+}
+
+impl GpuPipelines {
+    /// Record the conversion of a frame's code values into `encoder`,
+    /// reading and writing only `buffers` (see [`develop_footprint`]).
+    /// Nothing is submitted; the planes hold the result once the
+    /// submission completes. The values are [`crate::develop_planar`]'s,
+    /// bit for bit.
+    ///
+    /// The parameters and the table are uploaded with `queue.write_buffer`,
+    /// which wgpu performs before the commands of the next submission, so
+    /// conversions recorded into one submission need separate upload
+    /// buffers. The code values may come from a decode recorded earlier in
+    /// the same encoder.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_develop(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        header: &FrameHeader,
+        params: &DemosaicParams,
+        stage: Stage,
+        buffers: &DevelopBuffers<'_>,
+    ) -> Result<(), GpuError> {
+        let footprint = develop_footprint(header);
+        let samples = BufferRequest {
+            label: "prores raw samples",
+            bytes: sample_bytes(header),
+            usage: wgpu::BufferUsages::STORAGE,
+        };
+        check_limits(device, &footprint.requests()[1..])?;
+        check_limits(device, &[samples])?;
         let limits = device.limits();
-        let limit = u64::from(limits.max_storage_buffer_binding_size).min(limits.max_buffer_size);
-        if plane > limit {
-            return Err(GpuError::TooLarge {
-                what: "plane",
-                bytes: plane,
-                limit,
-            });
-        }
+        let b =
+            |binding, request| bind(binding, request, limits.min_storage_buffer_offset_alignment);
+        let params_b = bind(
+            &buffers.params,
+            &footprint.params,
+            limits.min_uniform_buffer_offset_alignment,
+        )?;
+        let lut_b = b(&buffers.lut, &footprint.lut)?;
+        let samples_b = b(&buffers.samples, &samples)?;
+        let rb_b = b(&buffers.rb, &footprint.rb)?;
+        let gr_b = b(&buffers.gr, &footprint.gr)?;
+        let red_b = b(&buffers.red, &footprint.red)?;
+        let green_b = b(&buffers.green, &footprint.green)?;
+        let blue_b = b(&buffers.blue, &footprint.blue)?;
+
         let conversion = Conversion::new(header, params, stage);
-        let block = params_block(header, &conversion);
-        let params_buf = self.params.get(device, PARAMS_BYTES as u64);
-        queue.write_buffer(params_buf, 0, &block);
+        queue.write_buffer(
+            params_b.buffer,
+            params_b.offset,
+            &params_block(header, &conversion),
+        );
         let lut: Vec<u8> = conversion
             .lut
             .iter()
             .flat_map(|v| v.to_le_bytes())
             .collect();
-        let lut_buf = self.lut.get(device, lut.len() as u64);
-        queue.write_buffer(lut_buf, 0, &lut);
-        let rb = self.rb.get(device, plane);
-        let gr = self.gr.get(device, plane);
+        queue.write_buffer(lut_b.buffer, lut_b.offset, &lut);
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("prores raw develop frame"),
-            layout: &self.pipelines.develop.layout,
+            layout: &self.develop.layout,
             entries: &[
-                entry(0, params_buf),
-                entry(1, lut_buf),
-                entry(2, samples),
-                entry(3, rb),
-                entry(4, gr),
-                entry(5, out[0]),
-                entry(6, out[1]),
-                entry(7, out[2]),
+                binding_entry(0, params_b),
+                binding_entry(1, lut_b),
+                binding_entry(2, samples_b),
+                binding_entry(3, rb_b),
+                binding_entry(4, gr_b),
+                binding_entry(5, red_b),
+                binding_entry(6, green_b),
+                binding_entry(7, blue_b),
             ],
-        });
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("prores raw develop"),
         });
         let groups = (
             u32::from(header.width).div_ceil(GROUP_SIDE),
             u32::from(header.height).div_ceil(GROUP_SIDE),
         );
-        let develop = &self.pipelines.develop;
-        for (label, pipeline) in [("green", &develop.green), ("chroma", &develop.chroma)] {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some(label),
-                timestamp_writes: None,
-            });
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("prores raw develop"),
+            timestamp_writes: None,
+        });
+        pass.set_bind_group(0, &bind_group, &[]);
+        for pipeline in [&self.develop.green, &self.develop.chroma] {
             pass.set_pipeline(pipeline);
-            pass.set_bind_group(0, &bind_group, &[]);
             pass.dispatch_workgroups(groups.0, groups.1, 1);
         }
-        queue.submit([encoder.finish()]);
         Ok(())
     }
 }
@@ -512,6 +664,112 @@ mod tests {
             Err(GpuError::BufferTooSmall { .. })
         ));
         assert!(run(&frame.samples, &buffer(plane, storage)).is_ok());
+    }
+
+    /// Decode and conversion recorded into one encoder, every buffer a
+    /// region of one shared buffer, as a consumer's arena would hand them
+    /// out.
+    #[test]
+    fn decode_and_develop_in_one_submission_from_one_buffer() {
+        let Some((device, queue)) = device() else {
+            return;
+        };
+        let pipelines = GpuPipelines::new(&device);
+        let mut rng = Rng::new(24);
+        let spec = Spec {
+            valid_tiles: true,
+            ..Spec::new(200, 72, crate::BayerPattern::Gbrg)
+        };
+        let packet = random_frame(&spec, &mut rng);
+        let header = crate::parse_header(&packet).unwrap();
+        let decode = crate::gpu::decode_footprint(&header, packet.len());
+        let develop = develop_footprint(&header);
+        let align = u64::from(device.limits().min_storage_buffer_offset_alignment);
+        let mut end = 0u64;
+        let mut place = |bytes: u64| {
+            let at = end.next_multiple_of(align);
+            end = at + bytes;
+            (at, bytes)
+        };
+        let d: Vec<_> = decode.requests().iter().map(|r| place(r.bytes)).collect();
+        // The conversion's parameters are a uniform, in a buffer of their own.
+        let v: Vec<_> = develop.requests()[1..]
+            .iter()
+            .map(|r| place(r.bytes))
+            .collect();
+        let uniform = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("uniform"),
+            size: develop.params.bytes,
+            usage: develop.params.usage,
+            mapped_at_creation: false,
+        });
+        let arena = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("arena"),
+            size: end.next_multiple_of(4),
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let region = |(at, bytes): (u64, u64)| wgpu::BufferBinding {
+            buffer: &arena,
+            offset: at,
+            size: wgpu::BufferSize::new(bytes),
+        };
+        let mut encoder = device.create_command_encoder(&Default::default());
+        let decode_buffers = crate::gpu::DecodeBuffers {
+            params: region(d[0]),
+            packet: region(d[1]),
+            streams: region(d[2]),
+            coefs: region(d[3]),
+            skipped: region(d[4]),
+            samples: region(d[5]),
+        };
+        let info = pipelines
+            .record_decode(&device, &queue, &mut encoder, &packet, &decode_buffers)
+            .unwrap();
+        let params = DemosaicParams::new(&info.header, info.quantizer());
+        let develop_buffers = DevelopBuffers {
+            params: uniform.as_entire_buffer_binding(),
+            lut: region(v[0]),
+            samples: region(d[5]),
+            rb: region(v[1]),
+            gr: region(v[2]),
+            red: region(v[3]),
+            green: region(v[4]),
+            blue: region(v[5]),
+        };
+        pipelines
+            .record_develop(
+                &device,
+                &queue,
+                &mut encoder,
+                &info.header,
+                &params,
+                Stage::Rec2020,
+                &develop_buffers,
+            )
+            .unwrap();
+        queue.submit([encoder.finish()]);
+        let all = crate::gpu::read_buffer(&device, &queue, &arena, arena.size()).unwrap();
+        let host = crate::develop_planar(
+            &crate::decode_frame(&packet).unwrap(),
+            &params,
+            Stage::Rec2020,
+        );
+        for (c, &(at, bytes)) in v[3..].iter().enumerate() {
+            let plane: Vec<f32> = all[at as usize..(at + bytes) as usize]
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .collect();
+            assert!(
+                plane
+                    .iter()
+                    .zip(&host.planes[c])
+                    .all(|(a, b)| a.to_bits() == b.to_bits()),
+                "channel {c}"
+            );
+        }
     }
 
     #[test]

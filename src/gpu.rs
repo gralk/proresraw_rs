@@ -27,7 +27,9 @@ use std::sync::Arc;
 
 mod develop;
 
-pub use develop::{GpuDeveloper, GpuRgb, plane_bytes};
+pub use develop::{
+    DevelopBuffers, DevelopFootprint, GpuDeveloper, GpuRgb, develop_footprint, plane_bytes,
+};
 
 use crate::codebook::{
     AC_CB, AC_INITIAL, Codebook, DC_CB, DC_RESET, FIRST_DC, LN_CB, LN_INITIAL, RN_CB, RN_INITIAL,
@@ -847,13 +849,6 @@ fn stream_table(
         }
     }
     (table, skipped)
-}
-
-fn entry(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
-    wgpu::BindGroupEntry {
-        binding,
-        resource: buffer.as_entire_binding(),
-    }
 }
 
 fn binding_entry(binding: u32, buffer: wgpu::BufferBinding<'_>) -> wgpu::BindGroupEntry<'_> {
