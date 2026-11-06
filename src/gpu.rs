@@ -21,6 +21,33 @@
 //! [`GpuDeveloper`] runs the raw conversion ([`crate::develop_planar`]) on
 //! such a buffer, or on an uploaded host frame, into three `f32` planes
 //! ([`GpuRgb`]) that stay on the GPU until downloaded.
+//!
+//! # Working with your own GPU memory
+//!
+//! [`GpuDecoder`] and [`GpuDeveloper`] are conveniences that own their
+//! scratch and submit their own work. Underneath, one [`GpuPipelines`] per
+//! device (shared behind an `Arc`) records into an encoder of yours with
+//! buffers of yours:
+//!
+//! 1. Plan: [`decode_footprint`] (from [`crate::parse_header`] on the
+//!    start of a packet) and [`develop_footprint`] list every buffer a
+//!    frame needs as [`BufferRequest`]s, with when each is dead.
+//! 2. Allocate, or hand out regions of larger blocks: storage bindings
+//!    start at multiples of `min_storage_buffer_offset_alignment`, and are
+//!    bound at exactly the requested size. All storage bindings are
+//!    read-write, so they may share one buffer; the conversion's parameter
+//!    block is a uniform and needs a buffer of its own.
+//! 3. Record: [`GpuPipelines::record_decode`], then
+//!    [`GpuPipelines::record_develop`] on its output, into one encoder,
+//!    and submit when you choose. Uploads go through `queue.write_buffer`,
+//!    which lands before the commands of the next submission, so frames
+//!    recorded into one submission need their own upload buffers.
+//!
+//! The conversion runs in row bands, so its green-pass scratch is
+//! [`develop_row_bytes`] per row of a band plus [`DEVELOP_GREEN_HALO`]
+//! rows each side; [`default_band_rows`] picks the tallest band the device
+//! allows, and [`DEVELOP_INPUT_HALO`] gives a planner the rows of code
+//! values a band reads beyond its edges.
 
 use std::fmt;
 use std::sync::Arc;

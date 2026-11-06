@@ -303,6 +303,53 @@ staging memory, which wgpu does not let the crate choose. The GPU path
 pays off most when the next stage also runs on the GPU and reads the
 planes in place.
 
+The conversion runs in row bands, so its scratch (two `f32` planes for
+the green pass, 8 bytes per pixel) covers one band rather than the whole
+frame. By default a band is the whole frame when that fits the device's
+storage binding limits and otherwise the tallest band that does: each
+green plane is 4 bytes per pixel, so whole frames above about 33 MP
+exceed wgpu's default 128 MiB per binding, and some devices allow less.
+`GpuDeveloper::set_band_rows`
+chooses the height. Every band height gives the same values; on the RTX
+3060, 256-row bands cost 3–8 % over whole frames, 64-row bands 10–15 %.
+
+### Using your own GPU memory and command encoder
+
+`GpuDecoder` and `GpuDeveloper` own their scratch and submit their own
+work. A consumer with its own GPU memory manager uses the layer beneath
+them instead:
+
+- `GpuPipelines::new(device)` compiles the shaders once per device;
+  share it behind an `Arc` (`GpuDecoder::with_pipelines`,
+  `GpuDeveloper::with_pipelines`, or directly).
+- `gpu::decode_footprint(&header, packet.len())` and
+  `gpu::develop_footprint(&header, band_rows, &limits)` list every
+  buffer a frame needs (label, bytes, usage), with the header from
+  `parse_header` on the start of the packet, so a frame can be admitted
+  before it is read. The docs of each request say when it is uploaded,
+  written, read and dead: the decoder's coefficients (2 bytes per pixel)
+  are dead after its transform pass, the conversion's green planes after
+  each band's chroma pass.
+- `record_decode` and `record_develop` take `wgpu::BufferBinding`s, so
+  each buffer may be a region of a larger block, and record into the
+  caller's encoder without submitting, so decode, conversion and
+  whatever follows share one submission. Storage bindings start at the
+  device's storage offset alignment and are all read-write, so they may
+  share one buffer (wgpu tracks usage per buffer within a dispatch); the
+  conversion's parameters are a uniform, kept so because the conversion
+  runs 40 % slower with them in storage, and need a buffer of their own.
+- For a band planner, `gpu::DEVELOP_INPUT_HALO` (3 rows of code values
+  read beyond a band), `gpu::DEVELOP_GREEN_HALO` (1 green row computed
+  beyond a band) and `gpu::develop_row_bytes` (8 bytes per pixel of a
+  green row) describe the conversion's needs; `gpu::default_band_rows`
+  is what a standalone caller gets.
+
+Uploads use `queue.write_buffer`, which wgpu performs before the next
+submission's commands: frames recorded into one submission need their
+own upload buffers. Readback is the caller's, from buffers it owns;
+`GpuFrame::download` and `GpuRgb::download` remain for simple use, and
+`release` frees a wrapper's scratch.
+
 ## Design
 
 `docs/bitstream.md` is the format description the code is written from.
