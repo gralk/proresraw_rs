@@ -263,6 +263,22 @@ parallel host decoder on the same machine:
 
 Entropy decoding is serial within a stream and dominates the GPU time.
 
+`GpuPipelines::record_decode_reduced` (or `GpuDecoder::decode_reduced`)
+decodes half, quarter or eighth size on the GPU as `decode_frame_reduced`
+does, value for value: three planes of code values (red, the first green,
+blue) that stay on the GPU, `GpuReducedFrame::download` giving the host's
+`RgbFrame`. Quarter and eighth size decode only the leading 16 or 4
+coefficients of each block and run a 4×4 or 2×2 transform. The entropy
+decode still dominates, so a reduced decode on its own is no faster than
+the parallel host decoder; it pays when the frame's next stage runs on the
+GPU too. Median per frame on an RTX 3060, upload included, against the
+host on a loaded machine:
+
+| clip | scale | GPU | host |
+|---|---|---|---|
+| Panasonic S5 via Atomos, HQ | half / quarter / eighth | 16.4 / 13.0 / 7.7 ms | 15.6 / 7.4 / 2.8 ms |
+| Sony a7S III via Atomos, HQ | half / quarter / eighth | 7.0 / 3.5 / 3.6 ms | 19.4 / 5.3 / 4.1 ms |
+
 ### Raw conversion on the GPU
 
 `GpuDeveloper` runs the raw conversion on the decoded buffer, so a frame
