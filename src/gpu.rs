@@ -18,6 +18,13 @@
 //! bits, the odd column in the high 16 bits. Apply the header curve to
 //! reach linear values, as on the host.
 //!
+//! [`GpuPipelines::record_decode_reduced`] decodes half, quarter or
+//! eighth size instead, as [`crate::decode_frame_reduced`] does: three
+//! planes of code values, red, green (the first green stream) and blue,
+//! each of [`reduced_plane_codes`] values packed two per word the same way,
+//! one pixel per 2×2, 4×4 or 8×8 sensels of the coded picture, bit-exactly
+//! with the host but for the same column-pass caveat at half size.
+//!
 //! [`GpuDeveloper`] runs the raw conversion ([`crate::develop_planar`]) on
 //! such a buffer, or on an uploaded host frame, into three `f32` planes
 //! ([`GpuRgb`]) that stay on the GPU until downloaded.
@@ -66,6 +73,7 @@ use crate::decoder::{Frame, ParsedFrame, parse_frame};
 use crate::error::Error;
 use crate::header::FrameHeader;
 use crate::idct::{BIAS, COS4, ROW_SET, ROW_TABLES, SCALE, TAN1, TAN2, TAN3};
+use crate::reduced::{Greens, RgbFrame, Scale};
 use crate::tile::{TILE_UNIT, Tile};
 
 /// Invocations per workgroup of the stream pass.
@@ -78,7 +86,7 @@ const STREAM_WORDS: usize = 4;
 /// Coefficient words of one 16×16 square: four blocks of 64 halves.
 const SQUARE_WORDS: u64 = 128;
 /// 32-bit words of the decoder's parameter block.
-const PARAMS_WORDS: u64 = 8 + 64;
+const PARAMS_WORDS: u64 = 8 + 64 + 1;
 
 /// Why a frame could not be decoded on the GPU.
 #[derive(Debug)]
@@ -282,6 +290,9 @@ pub struct GpuPipelines {
     decode_layout: wgpu::BindGroupLayout,
     decode_streams: wgpu::ComputePipeline,
     transform: wgpu::ComputePipeline,
+    transform_half: wgpu::ComputePipeline,
+    transform_quarter: wgpu::ComputePipeline,
+    transform_eighth: wgpu::ComputePipeline,
     develop: develop::Pipelines,
 }
 
@@ -337,6 +348,9 @@ impl GpuPipelines {
         GpuPipelines {
             decode_streams: pipeline("decode_streams"),
             transform: pipeline("transform"),
+            transform_half: pipeline("transform_half"),
+            transform_quarter: pipeline("transform_quarter"),
+            transform_eighth: pipeline("transform_eighth"),
             decode_layout: layout,
             develop: develop::Pipelines::new(device),
         }
@@ -397,6 +411,33 @@ impl GpuDecoder {
         })
     }
 
+    /// Decode `packet` at `scale` ([`GpuPipelines::record_decode_reduced`])
+    /// into a new buffer with `STORAGE | COPY_SRC` usage. The work is
+    /// submitted to `queue`.
+    pub fn decode_reduced(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        packet: &[u8],
+        scale: Scale,
+    ) -> Result<GpuReducedFrame, GpuError> {
+        let header = crate::decoder::parse_header(packet)?;
+        let planes = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("prores raw reduced planes"),
+            size: reduced_sample_bytes(&header, scale),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let info = self.submit_scaled(device, queue, packet, Some(scale), &planes)?;
+        Ok(GpuReducedFrame {
+            header: info.header,
+            scale,
+            planes,
+            skipped_tiles: info.skipped_tiles,
+            max_qscale: info.max_qscale,
+        })
+    }
+
     /// Largest tile qscale byte of the most recently submitted frame (see
     /// [`Frame::max_qscale`]).
     pub fn max_qscale(&self) -> u8 {
@@ -435,8 +476,23 @@ impl GpuDecoder {
         packet: &[u8],
         samples: &wgpu::Buffer,
     ) -> Result<DecodeInfo, GpuError> {
+        self.submit_scaled(device, queue, packet, None, samples)
+    }
+
+    /// [`Self::submit`], at a reduced `scale` when given.
+    fn submit_scaled(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        packet: &[u8],
+        scale: Option<Scale>,
+        samples: &wgpu::Buffer,
+    ) -> Result<DecodeInfo, GpuError> {
         let header = crate::decoder::parse_header(packet)?;
-        let f = decode_footprint(&header, packet.len());
+        let f = match scale {
+            None => decode_footprint(&header, packet.len()),
+            Some(scale) => reduced_footprint(&header, packet.len(), scale),
+        };
         let buffers = DecodeBuffers {
             params: self
                 .params
@@ -465,7 +521,7 @@ impl GpuDecoder {
         });
         let info = self
             .pipelines
-            .record_decode(device, &mut encoder, packet, &buffers)?;
+            .record(device, &mut encoder, packet, scale, &buffers)?;
         queue.submit([encoder.finish()]);
         self.skipped_tiles.clone_from(&info.skipped_tiles);
         self.max_qscale = info.max_qscale;
@@ -587,6 +643,34 @@ pub fn decode_footprint(header: &FrameHeader, packet_len: usize) -> DecodeFootpr
     }
 }
 
+/// [`decode_footprint`] for [`GpuPipelines::record_decode_reduced`] at
+/// `scale`: the same buffers, but `samples` holds the three reduced planes
+/// ([`reduced_sample_bytes`]).
+pub fn reduced_footprint(header: &FrameHeader, packet_len: usize, scale: Scale) -> DecodeFootprint {
+    let full = decode_footprint(header, packet_len);
+    DecodeFootprint {
+        samples: BufferRequest {
+            label: "prores raw reduced planes",
+            bytes: reduced_sample_bytes(header, scale),
+            ..full.samples
+        },
+        ..full
+    }
+}
+
+/// Code values of one plane of a reduced decode at `scale`: one per pixel
+/// of the coded picture divided by the scale factor, rows of
+/// `coded_width / factor` (padding of the last tiles included).
+pub fn reduced_plane_codes(header: &FrameHeader, scale: Scale) -> usize {
+    let shift = scale.log2_factor();
+    (header.coded_width() >> shift) * (header.coded_height() >> shift)
+}
+
+/// Bytes of the three planes of a reduced decode at `scale`.
+pub fn reduced_sample_bytes(header: &FrameHeader, scale: Scale) -> u64 {
+    3 * reduced_plane_codes(header, scale) as u64 * 2
+}
+
 /// Caller-provided buffers for [`GpuPipelines::record_decode`], one per
 /// [`DecodeFootprint`] request. Bindings may be regions of larger buffers,
 /// for example blocks of an arena.
@@ -698,8 +782,39 @@ impl GpuPipelines {
         packet: &[u8],
         buffers: &DecodeBuffers<'_>,
     ) -> Result<DecodeInfo, GpuError> {
+        self.record(device, encoder, packet, None, buffers)
+    }
+
+    /// [`Self::record_decode`] at a reduced size: `buffers.samples` (see
+    /// [`reduced_footprint`]) receives the red, green and blue planes of
+    /// [`crate::decode_frame_reduced`]'s code values (before the curve),
+    /// green from the first green stream. Quarter and eighth size decode
+    /// only the leading 16 or 4 coefficients of every block, and none of
+    /// the second green stream is decoded.
+    pub fn record_decode_reduced(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        packet: &[u8],
+        scale: Scale,
+        buffers: &DecodeBuffers<'_>,
+    ) -> Result<DecodeInfo, GpuError> {
+        self.record(device, encoder, packet, Some(scale), buffers)
+    }
+
+    fn record(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        packet: &[u8],
+        scale: Option<Scale>,
+        buffers: &DecodeBuffers<'_>,
+    ) -> Result<DecodeInfo, GpuError> {
         let parsed = parse_frame(packet)?;
-        let footprint = decode_footprint(&parsed.header, packet.len());
+        let footprint = match scale {
+            None => decode_footprint(&parsed.header, packet.len()),
+            Some(scale) => reduced_footprint(&parsed.header, packet.len(), scale),
+        };
         // Stream offsets are addressed in bits with 32-bit arithmetic.
         let bit_limit = u64::from(u32::MAX / 8);
         if footprint.packet.bytes > bit_limit {
@@ -721,9 +836,16 @@ impl GpuPipelines {
 
         let layout = Layout::new(&parsed.header);
         let mut skipped_tiles = Vec::new();
-        let (table, skipped_squares) = stream_table(packet, &parsed, &layout, &mut skipped_tiles);
+        let (table, skipped_squares) = stream_table(
+            packet,
+            &parsed,
+            &layout,
+            scale.is_some(),
+            &mut skipped_tiles,
+        );
         let streams = (table.len() / STREAM_WORDS) as u32;
-        let params = words_to_bytes(&params(&parsed.header, &layout, streams));
+        let log2_coefs = scale.map_or(6, Scale::log2_coefs);
+        let params = words_to_bytes(&params(&parsed.header, &layout, streams, log2_coefs));
         let table = words_to_bytes(&table);
         let skipped_squares = words_to_bytes(&skipped_squares);
         record_uploads(
@@ -770,7 +892,12 @@ impl GpuPipelines {
                 device.limits().max_compute_workgroups_per_dimension,
             );
             pass.dispatch_workgroups(x, y, 1);
-            pass.set_pipeline(&self.transform);
+            pass.set_pipeline(match scale {
+                None => &self.transform,
+                Some(Scale::Half) => &self.transform_half,
+                Some(Scale::Quarter) => &self.transform_quarter,
+                Some(Scale::Eighth) => &self.transform_eighth,
+            });
             pass.dispatch_workgroups(layout.squares_x, layout.squares_y, 1);
         }
         Ok(DecodeInfo {
@@ -843,6 +970,86 @@ impl GpuFrame {
     }
 }
 
+/// A frame decoded on the GPU at a reduced size
+/// ([`GpuDecoder::decode_reduced`]).
+#[derive(Debug)]
+pub struct GpuReducedFrame {
+    /// The frame header.
+    pub header: FrameHeader,
+    /// The output scale.
+    pub scale: Scale,
+    /// Red, green and blue code values, three planes of
+    /// [`reduced_plane_codes`] values, two per word (see the module docs).
+    pub planes: wgpu::Buffer,
+    /// Indices of tiles skipped for an invalid header; their pixels' codes
+    /// are 0.
+    pub skipped_tiles: Vec<usize>,
+    /// Largest qscale byte over all tiles, as in [`Frame::max_qscale`].
+    pub max_qscale: u8,
+}
+
+impl GpuReducedFrame {
+    /// Copy the planes to the host and linearize them as
+    /// [`crate::decode_frame_reduced`] does: the same [`RgbFrame`],
+    /// skipped tiles' pixels 0. Waits for the GPU.
+    pub fn download(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) -> Result<RgbFrame, GpuError> {
+        let header = &self.header;
+        let bytes = read_buffer(
+            device,
+            queue,
+            &self.planes,
+            reduced_sample_bytes(header, self.scale),
+        )?;
+        let codes: Vec<u16> = bytes
+            .chunks_exact(2)
+            .map(|h| u16::from_le_bytes([h[0], h[1]]))
+            .collect();
+        let n = reduced_plane_codes(header, self.scale);
+        let lut = header.curve.lut();
+        let mut samples = vec![0u16; 3 * n];
+        for (c, plane) in codes.chunks_exact(n).enumerate() {
+            for (i, &code) in plane.iter().enumerate() {
+                samples[3 * i + c] = lut[usize::from(code)];
+            }
+        }
+        // The host leaves a skipped tile's pixels 0, before the curve.
+        let shift = self.scale.log2_factor();
+        let stride = header.coded_width() >> shift;
+        let grid = crate::tile::TileGrid::new(
+            usize::from(header.width),
+            usize::from(header.height),
+            header.alignment,
+        );
+        let skipped: std::collections::HashSet<usize> =
+            self.skipped_tiles.iter().copied().collect();
+        for (index, tile) in grid.tiles().enumerate() {
+            if !skipped.contains(&index) {
+                continue;
+            }
+            let (x0, x1) = (
+                tile.x >> shift,
+                (tile.x + (TILE_UNIT << tile.log2_blocks)) >> shift,
+            );
+            let (y0, y1) = (tile.y >> shift, (tile.y + TILE_UNIT) >> shift);
+            for y in y0..y1 {
+                samples[3 * (y * stride + x0)..3 * (y * stride + x1)].fill(0);
+            }
+        }
+        Ok(RgbFrame {
+            header: header.clone(),
+            scale: self.scale,
+            greens: Greens::First,
+            samples,
+            skipped_tiles: self.skipped_tiles.clone(),
+            max_qscale: self.max_qscale,
+        })
+    }
+}
+
 /// Bytes of the output buffer for a frame with this header.
 pub fn sample_bytes(header: &FrameHeader) -> u64 {
     Layout::new(header).sample_bytes()
@@ -850,7 +1057,7 @@ pub fn sample_bytes(header: &FrameHeader) -> u64 {
 
 /// The parameter block: geometry, the phase of each stream and the
 /// quantization matrix.
-fn params(header: &FrameHeader, layout: &Layout, streams: u32) -> Vec<u32> {
+fn params(header: &FrameHeader, layout: &Layout, streams: u32, log2_coefs: u8) -> Vec<u32> {
     let mut phase_stream = [0u32; 4];
     for (stream, (row, col)) in header.bayer_pattern.stream_phases().into_iter().enumerate() {
         phase_stream[row * 2 + col] = stream as u32;
@@ -859,6 +1066,7 @@ fn params(header: &FrameHeader, layout: &Layout, streams: u32) -> Vec<u32> {
     let mut out = vec![layout.squares_x, layout.squares_y, streams, 0];
     out.extend(phase_stream);
     out.extend(header.quant_matrix.iter().map(|&q| u32::from(q)));
+    out.push(u32::from(log2_coefs));
     out
 }
 
@@ -870,6 +1078,7 @@ fn stream_table(
     packet: &[u8],
     parsed: &ParsedFrame<'_>,
     layout: &Layout,
+    reduced: bool,
     skipped_tiles: &mut Vec<usize>,
 ) -> (Vec<u32>, Vec<u32>) {
     let base = packet.as_ptr() as usize;
@@ -887,6 +1096,10 @@ fn stream_table(
             continue;
         };
         for (stream, data) in tile.streams.iter().enumerate() {
+            // A reduced decode reads only the first of the green streams.
+            if reduced && stream == 1 {
+                continue;
+            }
             // Streams are subslices of the packet; their address gives the offset.
             let offset = data.as_ptr() as usize - base;
             debug_assert!(offset + data.len() <= packet.len());
@@ -1278,6 +1491,88 @@ mod tests {
         }
         eprintln!("GPU vs host: {differ} of {total} samples differ, max |diff| {worst}");
         assert_eq!(differ, 0);
+    }
+
+    /// Reduced decodes at every scale, of frames with every pattern,
+    /// alignment, curve and invalid tiles, equal the host's
+    /// [`crate::decode_frame_reduced`] value for value.
+    #[test]
+    fn reduced_decode_matches_the_host() {
+        let Some((device, queue)) = device() else {
+            return;
+        };
+        let mut decoder = GpuDecoder::new(&device);
+        let mut rng = Rng::new(23);
+        let mut total = 0usize;
+        for spec in specs(&mut rng) {
+            let packet = random_frame(&spec, &mut rng);
+            for scale in [Scale::Half, Scale::Quarter, Scale::Eighth] {
+                let gpu = decoder
+                    .decode_reduced(&device, &queue, &packet, scale)
+                    .unwrap()
+                    .download(&device, &queue)
+                    .unwrap();
+                let host = crate::decode_frame_reduced(&packet, scale).unwrap();
+                assert_eq!(gpu.header, host.header);
+                assert_eq!(gpu.skipped_tiles, host.skipped_tiles);
+                assert_eq!(gpu.max_qscale, host.max_qscale);
+                assert_eq!(gpu.samples.len(), host.samples.len());
+                let differ = gpu
+                    .samples
+                    .iter()
+                    .zip(&host.samples)
+                    .filter(|(g, h)| g != h)
+                    .count();
+                assert_eq!(
+                    differ, 0,
+                    "{scale:?} {:?} {}x{} alignment {}: {differ} samples differ",
+                    spec.pattern, spec.width, spec.height, spec.alignment
+                );
+                total += host.samples.len();
+            }
+        }
+        assert!(total > 0);
+    }
+
+    /// A reduced decode recorded with caller buffers, the planes in a
+    /// region of a larger buffer, as a consumer's arena hands them out.
+    #[test]
+    fn record_decode_reduced_into_caller_buffers() {
+        let Some((device, queue)) = device() else {
+            return;
+        };
+        let pipelines = GpuPipelines::new(&device);
+        let mut rng = Rng::new(5);
+        let spec = Spec {
+            valid_tiles: true,
+            ..specs(&mut rng).swap_remove(0)
+        };
+        let packet = random_frame(&spec, &mut rng);
+        let header = crate::decoder::parse_header(&packet).unwrap();
+        for scale in [Scale::Half, Scale::Quarter, Scale::Eighth] {
+            let footprint = reduced_footprint(&header, packet.len(), scale);
+            assert_eq!(
+                footprint.samples.bytes,
+                reduced_sample_bytes(&header, scale)
+            );
+            let b = allocate(&device, &footprint);
+            let mut encoder = device.create_command_encoder(&Default::default());
+            let info = pipelines
+                .record_decode_reduced(&device, &mut encoder, &packet, scale, &buffers(&b))
+                .unwrap();
+            queue.submit([encoder.finish()]);
+            assert!(info.skipped_tiles.is_empty());
+            let gpu = GpuReducedFrame {
+                header: info.header,
+                scale,
+                planes: b[5].clone(),
+                skipped_tiles: info.skipped_tiles,
+                max_qscale: info.max_qscale,
+            }
+            .download(&device, &queue)
+            .unwrap();
+            assert_eq!(gpu, crate::decode_frame_reduced(&packet, scale).unwrap());
+        }
     }
 
     /// Every request of a footprint as a region of one shared buffer, the

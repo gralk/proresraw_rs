@@ -3,9 +3,15 @@
 // Pass 1, `decode_streams`: one invocation per tile component stream reads
 // its codewords and stores the dequantized, 16-bit-saturated coefficients
 // of its blocks into the cleared coefficient buffer, bit-exactly with the
-// host. Pass 2, `transform`: one workgroup per 16x16 sensel square
-// inverse-transforms the four blocks of the square with the Apple-compatible transform
-// and writes its code values. Integer arithmetic wraps, as on the host.
+// host; a reduced decode stops after the leading 16 or 4 coefficients of
+// every block, as `decode_component_reduced` does. Pass 2, `transform`:
+// one workgroup per 16x16 sensel square inverse-transforms the four blocks
+// of the square with the Apple-compatible transform and writes its code
+// values; `transform_half`, `transform_quarter` and `transform_eighth`
+// instead write red, green and blue planes of one pixel per 2x2, 4x4 or
+// 8x8 sensels from the red, first green and blue streams, with the 8x8,
+// 4x4 or 2x2 transform (src/reduced.rs). Integer arithmetic wraps, as on
+// the host.
 
 struct Params {
     squares_x: u32,
@@ -16,6 +22,9 @@ struct Params {
     // Stored stream index of each Bayer phase, indexed by row parity * 2 + column parity.
     phase_stream: array<u32, 4>,
     qmat: array<u32, 64>,
+    // log2 of the coefficients decoded per block: 6, or 4 or 2 for a
+    // reduced decode.
+    log2_coefs: u32,
 }
 
 // One component stream of one tile.
@@ -223,7 +232,7 @@ fn decode_streams(
     let log2 = st.info & 0xffu;
     let qscale = (st.info >> 8u) & 0xffu;
     let blocks = 1u << log2;
-    let codes = 64u * blocks;
+    let codes = blocks << params.log2_coefs;
     let block_mask = blocks - 1u;
     let base = st.square * 128u + (st.info >> 16u) * 32u;
     revisiting = false;
@@ -454,3 +463,189 @@ fn transform(
         samples[out_row + w] = select(blocks[even + w] | (blocks[odd + w] << 16u), 0u, skip);
     }
 }
+
+// --- Reduced passes ------------------------------------------------------
+//
+// Planes of code values, two per word, the even column in the low half:
+// red, then green, then blue, each `squares * side * side` codes for
+// `side` pixels per square side. Red is stream 3, green stream 0 (the first
+// green) and blue stream 2, whatever the Bayer pattern.
+
+const PLANE_STREAMS = array<u32, 3>(3u, 0u, 2u);
+
+// Word `w` of row `r` of channel `c`'s plane for the square at `group`,
+// where a square has `side` pixels per side.
+fn plane_word(group: vec3<u32>, c: u32, r: u32, w: u32, side: u32) -> u32 {
+    let words_per_row = params.squares_x * side / 2u;
+    let plane = words_per_row * params.squares_y * side;
+    return c * plane + (group.y * side + r) * words_per_row + group.x * side / 2u + w;
+}
+
+fn skipped_square(square: u32) -> bool {
+    return ((skipped[square >> 5u] >> (square & 31u)) & 1u) != 0u;
+}
+
+// Half size: the full 8x8 transform of every block, each block's 8x8 code
+// values the square's pixels of its channel.
+@compute @workgroup_size(32)
+fn transform_half(
+    @builtin(workgroup_id) group: vec3<u32>,
+    @builtin(local_invocation_index) t: u32,
+) {
+    let square = group.y * params.squares_x + group.x;
+    let stream = t >> 3u;
+    let k = t & 7u;
+    let block = stream * 64u;
+    var x: array<i32, 8>;
+    let row_words = square * 128u + stream * 32u + k * 4u;
+    for (var j = 0u; j < 4u; j++) {
+        let w = coefs[row_words + j];
+        x[2u * j] = bitcast<i32>(w << 16u) >> 16u;
+        x[2u * j + 1u] = bitcast<i32>(w) >> 16u;
+    }
+    let row = row_pass(x, k);
+    for (var j = 0u; j < 8u; j++) {
+        blocks[block + k * 8u + j] = bitcast<u32>(to_f32(row[j]) * SCALE);
+    }
+    workgroupBarrier();
+    var col: array<f32, 8>;
+    for (var i = 0u; i < 8u; i++) {
+        col[i] = bitcast<f32>(blocks[block + i * 8u + k]);
+    }
+    let values = column_pass(col);
+    for (var i = 0u; i < 8u; i++) {
+        blocks[block + i * 8u + k] = values[i];
+    }
+    workgroupBarrier();
+    // Each channel: 8 rows of 4 words.
+    let skip = skipped_square(square);
+    let r = t >> 2u;
+    let w = t & 3u;
+    for (var c = 0u; c < 3u; c++) {
+        let at = PLANE_STREAMS[c] * 64u + r * 8u + 2u * w;
+        let word = blocks[at] | (blocks[at + 1u] << 16u);
+        samples[plane_word(group, c, r, w, 8u)] = select(word, 0u, skip);
+    }
+}
+
+// The 4-point transform's row tables: (k, t0..t3) by row parity.
+const ROW4_K = array<i32, 2>(8192, 10703);
+const ROW4_T = array<i32, 8>(10703, 4433, 4433, -10703, 13985, 5793, 5793, -13985);
+// Column-pass scale of the 4-point transform: 2^-13.
+const SCALE4 = 0.0001220703125f;
+
+// Truncation toward zero, then saturation to 0..65535, as `output_code`.
+fn output_code(v: f32) -> u32 {
+    return u32(clamp(i32(v), 0, 65535));
+}
+
+// Quarter size: the 4x4 transform of each block's top-left corner.
+@compute @workgroup_size(32)
+fn transform_quarter(
+    @builtin(workgroup_id) group: vec3<u32>,
+    @builtin(local_invocation_index) t: u32,
+) {
+    let square = group.y * params.squares_x + group.x;
+    // Invocations 0..15: row (then column) t % 4 of stream t / 4.
+    let stream = (t >> 2u) & 3u;
+    let k = t & 3u;
+    let block = stream * 64u;
+    if t < 16u {
+        // Columns 0..3 of raster row k: words 0 and 1 of the row.
+        let row_words = square * 128u + stream * 32u + k * 4u;
+        let w0 = coefs[row_words];
+        let w1 = coefs[row_words + 1u];
+        let x0 = bitcast<i32>(w0 << 16u) >> 16u;
+        let x1 = bitcast<i32>(w0) >> 16u;
+        let x2 = bitcast<i32>(w1 << 16u) >> 16u;
+        let x3 = bitcast<i32>(w1) >> 16u;
+        let kk = ROW4_K[k & 1u];
+        let tt = (k & 1u) * 4u;
+        let e0 = kk * x0 + kk * x2;
+        let e1 = kk * x0 - kk * x2;
+        let o0 = ROW4_T[tt] * x1 + ROW4_T[tt + 1u] * x3;
+        let o1 = ROW4_T[tt + 2u] * x1 + ROW4_T[tt + 3u] * x3;
+        let y = array<i32, 4>(e0 + o0, e1 + o1, e1 - o1, e0 - o0);
+        for (var j = 0u; j < 4u; j++) {
+            blocks[block + k * 8u + j] = bitcast<u32>(to_f32(y[j]) * SCALE4);
+        }
+    }
+    workgroupBarrier();
+    if t < 16u {
+        // Column k of the block's 4x4 corner.
+        let r0 = bitcast<f32>(blocks[block + k]) + BIAS;
+        let r1 = bitcast<f32>(blocks[block + 8u + k]);
+        let r2 = bitcast<f32>(blocks[block + 16u + k]);
+        let r3 = bitcast<f32>(blocks[block + 24u + k]);
+        let e0 = r2 + r0;
+        let e1 = r0 - r2;
+        let f = rounded(r3 * TAN2) + r1;
+        let g = rounded(r1 * TAN2) - r3;
+        let y = array<f32, 4>(f + e0, g + e1, e1 - g, e0 - f);
+        // Each invocation reads and writes only its own column.
+        for (var i = 0u; i < 4u; i++) {
+            blocks[block + i * 8u + k] = output_code(y[i]);
+        }
+    }
+    workgroupBarrier();
+    // Each channel: 4 rows of 2 words.
+    if t < 24u {
+        let c = t >> 3u;
+        let r = (t >> 1u) & 3u;
+        let w = t & 1u;
+        let at = PLANE_STREAMS[c] * 64u + r * 8u + 2u * w;
+        let word = blocks[at] | (blocks[at + 1u] << 16u);
+        samples[plane_word(group, c, r, w, 4u)] = select(word, 0u, skipped_square(square));
+    }
+}
+
+// A dequantized coefficient of the block whose words start at `words`.
+fn coef(words: u32, raster: u32) -> i32 {
+    let w = coefs[words + (raster >> 1u)];
+    if (raster & 1u) == 0u {
+        return bitcast<i32>(w << 16u) >> 16u;
+    }
+    return bitcast<i32>(w) >> 16u;
+}
+
+// A centred value saturated to 16 bits as a code value, as `saturate_code`.
+fn saturate_code(v: i32) -> u32 {
+    return u32(clamp(v, -32768, 32767) + 32768);
+}
+
+// Eighth size: the 2x2 transform (sums and differences) of each block's
+// top-left corner.
+@compute @workgroup_size(32)
+fn transform_eighth(
+    @builtin(workgroup_id) group: vec3<u32>,
+    @builtin(local_invocation_index) t: u32,
+) {
+    let square = group.y * params.squares_x + group.x;
+    // Invocations 0..5: row t % 2 of channel t / 2.
+    if t >= 6u {
+        return;
+    }
+    let c = t >> 1u;
+    let r = t & 1u;
+    let words = square * 128u + PLANE_STREAMS[c] * 32u;
+    let d0 = coef(words, 0u);
+    let d1 = coef(words, 1u);
+    let d2 = coef(words, 8u);
+    let d3 = coef(words, 9u);
+    let top_sum = d0 + d1;
+    let top_diff = d0 - d1;
+    let bottom_sum = d2 + d3;
+    let bottom_diff = d2 - d3;
+    var left: u32;
+    var right: u32;
+    if r == 0u {
+        left = saturate_code(top_sum + bottom_sum);
+        right = saturate_code(top_diff + bottom_diff);
+    } else {
+        left = saturate_code(top_sum - bottom_sum);
+        right = saturate_code(top_diff - bottom_diff);
+    }
+    let word = left | (right << 16u);
+    samples[plane_word(group, c, r, 0u, 2u)] = select(word, 0u, skipped_square(square));
+}
+

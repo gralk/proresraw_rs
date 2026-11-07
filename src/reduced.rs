@@ -37,7 +37,7 @@ impl Scale {
         1 << self.log2_factor()
     }
 
-    fn log2_factor(self) -> u8 {
+    pub(crate) fn log2_factor(self) -> u8 {
         match self {
             Scale::Half => 1,
             Scale::Quarter => 2,
@@ -46,7 +46,7 @@ impl Scale {
     }
 
     /// `log2` of the coefficients decoded per block.
-    fn log2_coefs(self) -> u8 {
+    pub(crate) fn log2_coefs(self) -> u8 {
         match self {
             Scale::Half => 6,
             Scale::Quarter => 4,
